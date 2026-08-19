@@ -1,6 +1,9 @@
 # Unison
+<img width="1024" height="505" alt="UNISON LOGO" src="https://github.com/user-attachments/assets/9f2675d6-6c8c-4e4c-8578-e2575d80af49" />
+
 
 UWP WhatsApp Multi-Device client, aimed mainly at Windows 10 Mobile. Built as a Baileys-style secondary device.
+
 
 ## Status
 
@@ -21,12 +24,17 @@ The client is still under development. Note: None of the early users who tested 
 
 | Project | Role |
 |---|---|
-| `src/Unison.Uwp` | UWP app, views, DI adapters |
+| `src/Unison.Uwp` | UWP app, views, DI adapters, SocketBridge |
 | `src/Unison.Core` | Contracts, models, ViewModels |
-| `src/Unison.Baileys` | Protocol / crypto |
+| `src/Unison.Socket` | WhatsApp session / protocol (Baileys 7.0.0-rc14) |
+| `src/Unison.Baileys` | Noise, Signal, binary XML, protobuf, crypto |
 | `src/Unison.Background` | Out-of-process socket activity task |
 
-Solution: `Unison.slnx`.
+Solution: `Unison.slnx`. Docs: [`docs/wiki/`](docs/wiki/Home.md) (architecture) · [`Coding-Standards`](docs/wiki/Coding-Standards.md) (how to write code). Agents: [`AGENTS.md`](AGENTS.md).
+
+
+<img width="2314" height="1136" alt="image" src="https://github.com/user-attachments/assets/6869747d-5ef8-47fb-9c04-bb2d3f81f2ca" />
+
 
 ## Build & deploy
 
@@ -37,3 +45,11 @@ Solution: `Unison.slnx`.
 
 > [!WARNING]
 > Debug/ARM builds do not work on Windows Phone unless compiled with the .NET Native compiler. This project uses newer .NET Standard APIs that require runtime support unavailable in non-.NET Native builds.
+
+## License
+
+Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+
+You may use, modify, and share Unison for **non-commercial** purposes (personal, hobby, research, and the non-commercial organizations listed in the license). Selling Unison, or using it to provide a commercial product or service, is not allowed.
+
+This is not an OSI-approved open-source license. The full terms are in [`LICENSE`](LICENSE).
