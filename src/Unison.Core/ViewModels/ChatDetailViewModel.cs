@@ -1,6 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -74,6 +75,9 @@ namespace Unison.Core.ViewModels
         /// <summary>Device People card for contacts not yet in the address book.</summary>
         private readonly IContactService _contactService;
 
+        /// <summary>Mobile vs desktop UI window sizes.</summary>
+        private readonly ISystemInfoProvider _systemInfo;
+
         /// <summary>Debug session log (visible on Debug screen).</summary>
         private readonly ISessionLogger _sessionLogger;
 
@@ -105,11 +109,17 @@ namespace Unison.Core.ViewModels
         private bool _hasReachedStart;
         private int _emptyLoadAttempts;
 
+        /// <summary>
+        /// Per open-chat lookup of group participant labels/avatars (plus 1:1 indexes).
+        /// Owned for the VM lifetime; roster hooks detach on uninitialize without Dispose.
+        /// </summary>
+        private readonly GroupParticipantLookup _participants;
+
         /// <summary>How many bubble VMs to materialize when opening a chat (service may hold more data).</summary>
-        public const int InitialUiMessageWindow = 50;
+        public int InitialUiMessageWindow { get; }
 
         /// <summary>Hard cap on timeline VMs while the chat is open (trim after live sync / load-more).</summary>
-        public const int MaxUiMessageWindow = 150;
+        public int MaxUiMessageWindow { get; }
 
         public ChatDetailViewModel(
             IWhatsAppService whatsAppService,
@@ -128,7 +138,8 @@ namespace Unison.Core.ViewModels
             ISessionLogger sessionLogger = null,
             IRuntimeDiagnostics diagnostics = null,
             IChatService chatService = null,
-            IContactService contactService = null)
+            IContactService contactService = null,
+            ISystemInfoProvider systemInfo = null)
         {
             _chatService = chatService;
             _whatsAppService = whatsAppService;
@@ -145,8 +156,13 @@ namespace Unison.Core.ViewModels
             _strings = strings;
             _personStore = personStore;
             _contactService = contactService;
+            _systemInfo = systemInfo;
             _sessionLogger = sessionLogger;
             _diagnostics = diagnostics;
+
+            bool mobile = _systemInfo != null && _systemInfo.IsMobile();
+            InitialUiMessageWindow = mobile ? 30 : 50;
+            MaxUiMessageWindow = mobile ? 80 : 150;
 
             Messages = new ObservableCollection<ChatMessageViewModel>();
 
@@ -210,12 +226,17 @@ namespace Unison.Core.ViewModels
             AddContactCommand = new RelayCommand(
                 () => _ = AddContactAsync(),
                 () => CanAddToAddressBook);
+
+            _participants = new GroupParticipantLookup(_whatsAppService, _personStore, SelfListDisplayName);
+            _participants.ParticipantAvatarChanged += OnParticipantAvatarChanged;
         }
 
         // ── Lifecycle ─────────────────────────────────────────────────────────
 
         public Task InitializeAsync()
         {
+            _participants.ParticipantAvatarChanged -= OnParticipantAvatarChanged;
+            _participants.ParticipantAvatarChanged += OnParticipantAvatarChanged;
             Attach();
             return Task.CompletedTask;
         }
@@ -228,6 +249,8 @@ namespace Unison.Core.ViewModels
         {
             StopPresenceWatch();
             await CancelRecordingCoreAsync();
+            _participants.ParticipantAvatarChanged -= OnParticipantAvatarChanged;
+            _participants.DetachHooks();
             ClearTimeline();
             if (_contactService != null)
             {
@@ -320,6 +343,8 @@ namespace Unison.Core.ViewModels
         {
             _hasReachedStart = false;
             _emptyLoadAttempts = 0;
+            IsLoadingMore = false;
+            IsLoadingMessages = false;
             OnPropertyChanged(nameof(CanLoadMore));
         }
 
@@ -506,6 +531,7 @@ namespace Unison.Core.ViewModels
                 if (Set(ref _isLoadingMessages, value))
                 {
                     OnPropertyChanged(nameof(CanLoadMore));
+                    OnPropertyChanged(nameof(IsTimelineBusy));
                 }
             }
         }
@@ -518,19 +544,38 @@ namespace Unison.Core.ViewModels
                 if (Set(ref _isLoadingMore, value))
                 {
                     OnPropertyChanged(nameof(CanLoadMore));
+                    OnPropertyChanged(nameof(IsTimelineBusy));
                 }
             }
         }
 
         /// <summary>
+        /// First open or load-more in flight — drives the header progress and scroll lock.
+        /// </summary>
+        public bool IsTimelineBusy => IsLoadingMessages || IsLoadingMore;
+
+        /// <summary>
         /// Whether the view may request older messages (scroll near top).
         /// Service/SQLite keep data; this only gates materializing more bubble VMs.
+        /// <see cref="IsLoadingMore"/> is the re-entrancy lock for that path.
         /// </summary>
         public bool CanLoadMore =>
             HasActiveChat &&
             !IsLoadingMore &&
             !IsLoadingMessages &&
             !_hasReachedStart;
+
+        /// <summary>Marks the initial timeline fetch for the open chat (progress + scroll lock).</summary>
+        public void BeginLoadingMessages()
+        {
+            IsLoadingMessages = true;
+        }
+
+        /// <summary>Clears the initial timeline fetch flag.</summary>
+        public void EndLoadingMessages()
+        {
+            IsLoadingMessages = false;
+        }
 
         /// <summary>
         /// Whether the composer accepts input at all. Public because the wide-layout clip button
@@ -759,12 +804,20 @@ namespace Unison.Core.ViewModels
         }
 
         /// <summary>Opens the group-member profile pane (media/files filtered to that author).</summary>
-        public void OpenGroupMemberInfo(GroupMember member)
+        public void OpenGroupMemberInfo(GroupMember member, string participantJid = null, string nameHint = null)
         {
             if (member == null || ActiveChat == null || _infoFactory == null)
             {
                 return;
             }
+
+            GroupParticipantResolver.EnrichMember(
+                member,
+                participantJid ?? member.Jid ?? member.Lid ?? member.PhoneNumber,
+                ActiveChat,
+                _whatsAppService,
+                _personStore,
+                nameHint);
 
             ChatDetailInfoViewModel previous = ChatDetailInfo;
             ChatDetailInfo = _infoFactory.CreateGroupMember(ActiveChat, member);
@@ -775,72 +828,164 @@ namespace Unison.Core.ViewModels
         /// <summary>
         /// Resolves a timeline participant to a <see cref="GroupMember"/> (roster or ephemeral) and opens info.
         /// </summary>
-        public void OpenGroupMemberInfoByJid(string participantJid)
+        public void OpenGroupMemberInfoByJid(string participantJid, string nameHint = null)
         {
             if (string.IsNullOrWhiteSpace(participantJid) || ActiveChat == null)
             {
                 return;
             }
 
-            GroupMember member = FindGroupMember(participantJid);
+            _participants.EnsureFresh(ActiveChat);
+            GroupMember member = _participants.Find(participantJid);
             if (member == null)
             {
                 member = new GroupMember
                 {
-                    Jid = JidHelper.Normalize(participantJid),
-                    DisplayName = _whatsAppService?.ResolveDisplayName(participantJid, "sender"),
-                    AvatarUrl = ResolveParticipantContactUri(participantJid, ActiveChat)
+                    Jid = JidHelper.Normalize(participantJid)
                 };
             }
 
-            OpenGroupMemberInfo(member);
+            OpenGroupMemberInfo(member, participantJid, nameHint);
         }
 
-        private GroupMember FindGroupMember(string participantJid)
+        /// <summary>
+        /// Opens a group member from a quote header when only the display name is known.
+        /// </summary>
+        public void OpenGroupMemberInfoByDisplayName(string displayName)
         {
-            if (ActiveChat?.GroupMembers == null || string.IsNullOrWhiteSpace(participantJid))
+            if (ActiveChat == null || !ActiveChat.IsGroup || string.IsNullOrWhiteSpace(displayName))
             {
-                return null;
+                return;
+            }
+
+            GroupMember member = FindGroupMemberByDisplayName(displayName.Trim());
+            if (member == null)
+            {
+                return;
+            }
+
+            OpenGroupMemberInfo(member, member.Jid ?? member.Lid ?? member.PhoneNumber, displayName.Trim());
+        }
+
+        /// <summary>
+        /// Quote author strip: JID first, else roster match on the visible name.
+        /// </summary>
+        public void OpenQuotedAuthor(string participantJid, string senderName)
+        {
+            if (ActiveChat == null || !ActiveChat.IsGroup)
+            {
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(participantJid))
+            {
+                OpenGroupMemberInfoByJid(participantJid, senderName);
+                return;
+            }
+
+            OpenGroupMemberInfoByDisplayName(senderName);
+        }
+
+        /// <summary>
+        /// Rebuilds participant name/avatar/roster indexes for the active chat.
+        /// </summary>
+        public void RebuildParticipantLookup()
+        {
+            _participants.Rebuild(ActiveChat);
+        }
+
+        /// <summary>
+        /// Pushes a freshly hydrated roster avatar into any visible bubbles that still show a
+        /// blank contact slot for that participant. Cache update is already done by the lookup.
+        /// </summary>
+        private void OnParticipantAvatarChanged(string participantJid, string avatarUrl)
+        {
+            if (string.IsNullOrWhiteSpace(participantJid) || string.IsNullOrWhiteSpace(avatarUrl))
+            {
+                return;
             }
 
             string canonical = _whatsAppService != null
                 ? _whatsAppService.GetCanonicalJid(participantJid)
                 : JidHelper.Normalize(participantJid);
 
-            foreach (var member in ActiveChat.GroupMembers)
+            for (int i = 0; i < Messages.Count; i++)
             {
-                if (member == null)
+                ChatMessage model = Messages[i]?.Model;
+                if (model == null || model.IsFromMe || !model.ShowContactSlot)
                 {
                     continue;
                 }
 
-                if (JidsMatchCanonical(member.Jid, canonical) ||
-                    JidsMatchCanonical(member.PhoneNumber, canonical) ||
-                    JidsMatchCanonical(member.Lid, canonical))
+                if (!ParticipantJidEquals(model.ParticipantJid, participantJid, canonical))
                 {
-                    return member;
+                    continue;
                 }
-            }
 
-            return null;
+                if (string.Equals(model.ContactUri, avatarUrl, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                model.ContactUri = avatarUrl;
+            }
         }
 
-        private bool JidsMatchCanonical(string jid, string canonical)
+        private bool ParticipantJidEquals(string left, string right, string rightCanonical)
         {
-            if (string.IsNullOrWhiteSpace(jid) || string.IsNullOrWhiteSpace(canonical))
+            if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
             {
                 return false;
             }
 
-            string other = _whatsAppService != null
-                ? _whatsAppService.GetCanonicalJid(jid)
-                : JidHelper.Normalize(jid);
-            if (string.IsNullOrWhiteSpace(other))
+            if (string.Equals(left, right, StringComparison.OrdinalIgnoreCase))
             {
-                other = JidHelper.Normalize(jid);
+                return true;
             }
 
-            return string.Equals(other, canonical, StringComparison.OrdinalIgnoreCase);
+            string leftCanonical = _whatsAppService != null
+                ? _whatsAppService.GetCanonicalJid(left)
+                : JidHelper.Normalize(left);
+            return !string.IsNullOrWhiteSpace(leftCanonical) &&
+                   !string.IsNullOrWhiteSpace(rightCanonical) &&
+                   string.Equals(leftCanonical, rightCanonical, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string SelfListDisplayName()
+        {
+            return _strings?.Get("Chat_SelfFallbackName", "You") ?? "You";
+        }
+
+        private GroupMember FindGroupMemberByDisplayName(string displayName)
+        {
+            if (ActiveChat?.GroupMembers == null || string.IsNullOrWhiteSpace(displayName))
+            {
+                return null;
+            }
+
+            string needle = displayName.Trim();
+            GroupMember partial = null;
+            for (int i = 0; i < ActiveChat.GroupMembers.Count; i++)
+            {
+                GroupMember member = ActiveChat.GroupMembers[i];
+                if (member == null || string.IsNullOrWhiteSpace(member.DisplayName))
+                {
+                    continue;
+                }
+
+                if (string.Equals(member.DisplayName, needle, StringComparison.OrdinalIgnoreCase))
+                {
+                    return member;
+                }
+
+                if (partial == null &&
+                    member.DisplayName.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    partial = member;
+                }
+            }
+
+            return partial;
         }
 
         public void CloseChatDetailInfo()
@@ -906,6 +1051,8 @@ namespace Unison.Core.ViewModels
                 CloseChatDetailInfo();
                 ResetTimelinePaging();
             }
+
+            RebuildParticipantLookup();
 
             RaisePinToStartCanExecuteChanged();
             RaiseMuteCommandsCanExecuteChanged();
@@ -1098,6 +1245,71 @@ namespace Unison.Core.ViewModels
             (MuteFor1WeekCommand as RelayCommand)?.RaiseCanExecuteChanged();
             (MuteForeverCommand as RelayCommand)?.RaiseCanExecuteChanged();
             (UnmuteLocalCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        }
+
+        /// <summary>
+        /// Finds a loaded bubble VM by protocol message id.
+        /// </summary>
+        public ChatMessageViewModel FindMessageById(string messageId)
+        {
+            if (string.IsNullOrWhiteSpace(messageId))
+            {
+                return null;
+            }
+
+            for (int i = 0; i < Messages.Count; i++)
+            {
+                ChatMessageViewModel candidate = Messages[i];
+                if (candidate != null && string.Equals(candidate.Id, messageId, StringComparison.Ordinal))
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Loads older timeline pages until <paramref name="quotedMessageId"/> appears or history ends.
+        /// </summary>
+        public async Task<ChatMessageViewModel> NavigateToQuotedMessageAsync(string quotedMessageId, int maxLoadAttempts = 24)
+        {
+            ChatMessageViewModel target = FindMessageById(quotedMessageId);
+            if (target != null)
+            {
+                return target;
+            }
+
+            if (_activeChat == null || string.IsNullOrWhiteSpace(quotedMessageId))
+            {
+                return null;
+            }
+
+            int attempts = 0;
+            while (CanLoadMore && attempts < maxLoadAttempts)
+            {
+                attempts++;
+                ChatTimelineLoadMoreResult result = await LoadMoreMessagesAsync().ConfigureAwait(false);
+                if (_activeChat == null)
+                {
+                    return null;
+                }
+
+                target = FindMessageById(quotedMessageId);
+                if (target != null)
+                {
+                    return target;
+                }
+
+                if (result == null ||
+                    result.ReachedStart ||
+                    (result.PrependedCount == 0 && !result.WaitingForOnDemand))
+                {
+                    break;
+                }
+            }
+
+            return FindMessageById(quotedMessageId);
         }
 
         /// <summary>
@@ -1319,9 +1531,19 @@ namespace Unison.Core.ViewModels
             RemovePreviewFallbackMessages();
             bool changed = Messages.Count != countBeforeFallbackStrip;
 
-            var existingIds = new HashSet<string>(
-                Messages.Where(m => m != null && !string.IsNullOrWhiteSpace(m.Id)).Select(m => m.Id),
+            var byId = new Dictionary<string, ChatMessageViewModel>(
+                Messages.Count,
                 StringComparer.Ordinal);
+            for (int i = 0; i < Messages.Count; i++)
+            {
+                ChatMessageViewModel row = Messages[i];
+                if (row == null || string.IsNullOrWhiteSpace(row.Id))
+                {
+                    continue;
+                }
+
+                byId[row.Id] = row;
+            }
 
             for (int i = 0; i < serviceMessages.Count; i++)
             {
@@ -1331,7 +1553,7 @@ namespace Unison.Core.ViewModels
                     continue;
                 }
 
-                ChatMessageViewModel existing = FindTimelineRow(msg, existingIds);
+                ChatMessageViewModel existing = FindTimelineRow(msg, byId);
                 if (existing != null)
                 {
                     ApplyLiveFieldsTo(existing.Model, msg);
@@ -1339,10 +1561,10 @@ namespace Unison.Core.ViewModels
                 }
 
                 StampGroupRemoteJid(new[] { msg }, requestedJid);
-                InsertTimelineMessage(msg);
-                if (!string.IsNullOrWhiteSpace(msg.Id))
+                ChatMessageViewModel inserted = InsertTimelineMessage(msg);
+                if (inserted != null && !string.IsNullOrWhiteSpace(msg.Id))
                 {
-                    existingIds.Add(msg.Id);
+                    byId[msg.Id] = inserted;
                 }
 
                 changed = true;
@@ -1356,21 +1578,33 @@ namespace Unison.Core.ViewModels
         /// Row already on screen for <paramref name="message"/>. Rows without an id (local echo)
         /// are matched on timestamp + direction + text, which is all they have.
         /// </summary>
-        private ChatMessageViewModel FindTimelineRow(ChatMessage message, HashSet<string> existingIds)
+        private ChatMessageViewModel FindTimelineRow(
+            ChatMessage message,
+            Dictionary<string, ChatMessageViewModel> byId)
         {
             if (!string.IsNullOrWhiteSpace(message.Id))
             {
-                return existingIds.Contains(message.Id)
-                    ? Messages.FirstOrDefault(m => string.Equals(m?.Id, message.Id, StringComparison.Ordinal))
-                    : null;
+                ChatMessageViewModel row;
+                return byId != null && byId.TryGetValue(message.Id, out row) ? row : null;
             }
 
-            return Messages.FirstOrDefault(m =>
-                m?.Model != null &&
-                string.IsNullOrWhiteSpace(m.Id) &&
-                m.Timestamp == message.Timestamp &&
-                m.IsFromMe == message.IsFromMe &&
-                string.Equals(m.Model.Content, message.Content, StringComparison.Ordinal));
+            for (int i = 0; i < Messages.Count; i++)
+            {
+                ChatMessageViewModel m = Messages[i];
+                if (m?.Model == null || !string.IsNullOrWhiteSpace(m.Id))
+                {
+                    continue;
+                }
+
+                if (m.Timestamp == message.Timestamp &&
+                    m.IsFromMe == message.IsFromMe &&
+                    string.Equals(m.Model.Content, message.Content, StringComparison.Ordinal))
+                {
+                    return m;
+                }
+            }
+
+            return null;
         }
 
         /// <summary>Copies the fields a reload can carry forward onto a row already on screen.</summary>
@@ -1388,7 +1622,7 @@ namespace Unison.Core.ViewModels
             target.PinExpiresAtUtc = source.PinExpiresAtUtc;
             target.RemoteJid = source.RemoteJid;
             target.ParticipantJid = source.ParticipantJid;
-            target.Reactions = source.Reactions;
+            HistoryMessageMapper.CopyReactionState(target, source);
             if (source.IsRevoked)
             {
                 target.Content = source.Content;
@@ -1403,6 +1637,7 @@ namespace Unison.Core.ViewModels
                 target.QuotedText = source.QuotedText;
                 target.QuotedKind = source.QuotedKind;
                 target.QuotedSenderName = source.QuotedSenderName;
+                target.QuotedParticipantJid = source.QuotedParticipantJid;
             }
             if (!string.IsNullOrWhiteSpace(source.ImageUri))
             {
@@ -1811,6 +2046,13 @@ namespace Unison.Core.ViewModels
         {
             if (_activeChat == null || _isSending || _isRecording) return;
 
+            // Collapse the growing composer back to one line before the recording overlay
+            // takes over (audio flow may change later; for now clear is enough).
+            if (!string.IsNullOrEmpty(MessageText))
+            {
+                MessageText = string.Empty;
+            }
+
             try
             {
                 LogSend("record-start");
@@ -2104,17 +2346,17 @@ namespace Unison.Core.ViewModels
         }
 
         /// <summary>Inserts one row at its chronological position (live append / load-more).</summary>
-        public void InsertTimelineMessage(ChatMessage message)
+        public ChatMessageViewModel InsertTimelineMessage(ChatMessage message)
         {
             if (message == null || _messageFactory == null)
             {
-                return;
+                return null;
             }
 
             var vm = CreateMessageVm(message);
             if (vm == null)
             {
-                return;
+                return null;
             }
 
             int index = ChatMessageOrder.FindInsertIndex(
@@ -2124,11 +2366,13 @@ namespace Unison.Core.ViewModels
                 message.Timestamp,
                 message.Id);
             Messages.Insert(index, vm);
+            return vm;
         }
 
         /// <summary>
         /// One pass over the visible timeline: run chrome, date chips, sender labels, and group
         /// author avatars. The bubble only binds the resolved <see cref="ChatMessage.ContactUri"/>.
+        /// Mentions refresh stays here (needs bubble VMs).
         /// </summary>
         public void ApplyMessageRunLayout(IList<ChatMessage> messages, bool isGroup, ChatItem groupChat)
         {
@@ -2141,74 +2385,70 @@ namespace Unison.Core.ViewModels
             string yesterdayLabel = _strings != null
                 ? _strings.Get("Common_Yesterday", "Yesterday")
                 : "Yesterday";
-            DateTime? previousLocalDate = null;
 
-            for (int i = 0; i < messages.Count; i++)
+            MessageRunLayout.Apply(
+                messages,
+                isGroup,
+                groupChat ?? ActiveChat,
+                _participants,
+                todayLabel,
+                yesterdayLabel,
+                QuotedMessageIdIsFromMe);
+
+            System.Collections.Generic.IReadOnlyDictionary<string, string> lookup =
+                isGroup ? (groupChat ?? ActiveChat)?.MentionLookup : null;
+            for (int i = 0; i < Messages.Count; i++)
             {
-                var current = messages[i];
-                if (current == null)
+                ChatMessageViewModel row = Messages[i];
+                if (row?.Model == null || !row.Model.HasMentions)
                 {
                     continue;
                 }
 
-                DateTime localDate = WhatsAppMapper.ToLocalCalendarDate(current.Timestamp);
-                bool isFirstOfDay = localDate != DateTime.MinValue &&
-                    (!previousLocalDate.HasValue || localDate != previousLocalDate.Value);
-                current.IsFirstOfDay = isFirstOfDay;
-                current.DateSeparatorText = isFirstOfDay
-                    ? WhatsAppMapper.FormatDaySeparator(current.Timestamp, todayLabel, yesterdayLabel)
-                    : string.Empty;
-                if (localDate != DateTime.MinValue)
-                {
-                    previousLocalDate = localDate;
-                }
-
-                if (isGroup)
-                {
-                    EnsureGroupSenderName(current);
-                }
-
-                bool isRunStart = i == 0;
-                bool isRunEnd = i == messages.Count - 1;
-
-                if (!isRunStart)
-                {
-                    isRunStart = !IsSameMessageRun(messages[i - 1], current);
-                }
-
-                if (!isRunEnd)
-                {
-                    isRunEnd = !IsSameMessageRun(current, messages[i + 1]);
-                }
-
-                current.IsRunStart = isRunStart;
-                current.IsRunEnd = isRunEnd;
-                current.ShowGroupSenderName =
-                    isGroup &&
-                    isRunStart &&
-                    !current.IsFromMe &&
-                    !string.IsNullOrWhiteSpace(current.SenderName) &&
-                    !string.Equals(current.SenderName, "Me", StringComparison.OrdinalIgnoreCase) &&
-                    !string.Equals(current.SenderName, "You", StringComparison.OrdinalIgnoreCase);
-
-                bool contactSlot = isGroup && !current.IsFromMe;
-                current.ShowContactSlot = contactSlot;
-                current.ShowContact = contactSlot && isRunStart;
-                current.ContactUri = contactSlot
-                    ? ResolveParticipantContactUri(current.ParticipantJid, groupChat)
-                    : null;
-            }
-
-            System.Collections.Generic.IReadOnlyDictionary<string, string> lookup =
-                isGroup ? groupChat?.MentionLookup : null;
-            for (int i = 0; i < Messages.Count; i++)
-            {
-                Messages[i]?.RefreshMentions(lookup);
+                row.RefreshMentions(lookup);
             }
         }
 
         /// <summary>
+        /// Asks the contact façade for pictures of group authors currently on screen.
+        /// Cheap no-op when not a group or the JID list is empty.
+        /// </summary>
+        public void RequestVisibleParticipantAvatars(IEnumerable<string> participantJids)
+        {
+            if (_contactService == null || ActiveChat == null || !ActiveChat.IsGroup)
+            {
+                return;
+            }
+
+            if (participantJids == null)
+            {
+                return;
+            }
+
+            var jids = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string jid in participantJids)
+            {
+                if (string.IsNullOrWhiteSpace(jid) || !seen.Add(jid))
+                {
+                    continue;
+                }
+
+                jids.Add(jid);
+            }
+
+            if (jids.Count == 0)
+            {
+                return;
+            }
+
+            string groupJid = ActiveChat.JID;
+            _ = _contactService.HydrateGroupMemberAvatarsForJidsAsync(groupJid, jids);
+        }
+
+        /// <summary>
         /// Relabels date chips after local midnight (Hoje / Ontem / date). Call from the view timer.
+        /// Does not re-resolve participant names/avatars — only the date separator fields.
         /// </summary>
         public void RefreshDateSeparators()
         {
@@ -2217,171 +2457,56 @@ namespace Unison.Core.ViewModels
                 return;
             }
 
+            string todayLabel = _strings != null ? _strings.Get("Common_Today", "Today") : "Today";
+            string yesterdayLabel = _strings != null
+                ? _strings.Get("Common_Yesterday", "Yesterday")
+                : "Yesterday";
+
             var models = new List<ChatMessage>(Messages.Count);
             for (int i = 0; i < Messages.Count; i++)
             {
-                models.Add(Messages[i]?.Model);
+                ChatMessage current = Messages[i]?.Model;
+                if (current != null)
+                {
+                    models.Add(current);
+                }
             }
 
-            ApplyMessageRunLayout(models, ActiveChat?.IsGroup ?? false, ActiveChat);
+            MessageRunLayout.RefreshDateSeparators(models, todayLabel, yesterdayLabel);
         }
 
         /// <summary>
-        /// Group author photo: roster → canonical 1:1 chat → Person cache.
-        /// Literal JID equality fails for LID vs PN.
+        /// Group author photo: roster (live) → cached map → 1:1 index → Person → resolver fallback.
         /// </summary>
         public string ResolveParticipantContactUri(string participantJid, ChatItem groupChat)
         {
-            if (_whatsAppService == null || string.IsNullOrWhiteSpace(participantJid))
-            {
-                return null;
-            }
-
-            string canonical = _whatsAppService.GetCanonicalJid(participantJid);
-            if (string.IsNullOrWhiteSpace(canonical))
-            {
-                canonical = JidHelper.Normalize(participantJid);
-            }
-
-            string fromRoster = FindAvatarOnGroupRoster(groupChat, canonical);
-            if (!string.IsNullOrWhiteSpace(fromRoster))
-            {
-                return fromRoster;
-            }
-
-            string fromDirect = FindAvatarOnDirectChat(canonical);
-            if (!string.IsNullOrWhiteSpace(fromDirect))
-            {
-                return fromDirect;
-            }
-
-            return FindAvatarOnPerson(canonical, participantJid);
+            return _participants.ResolveContactUri(participantJid, groupChat ?? ActiveChat);
         }
 
-        private string FindAvatarOnGroupRoster(ChatItem groupChat, string canonicalParticipant)
+        /// <summary>
+        /// Timeline scan: true when the quoted message id matches an outgoing bubble on screen.
+        /// Self-JID checks live in <see cref="GroupParticipantLookup"/>.
+        /// </summary>
+        private bool QuotedMessageIdIsFromMe(string quotedId)
         {
-            if (groupChat?.GroupMembers == null || groupChat.GroupMembers.Count == 0 ||
-                string.IsNullOrWhiteSpace(canonicalParticipant))
-            {
-                return null;
-            }
-
-            foreach (var member in groupChat.GroupMembers)
-            {
-                if (member == null || string.IsNullOrWhiteSpace(member.AvatarUrl))
-                {
-                    continue;
-                }
-
-                if (JidsMatchCanonical(member.Jid, canonicalParticipant) ||
-                    JidsMatchCanonical(member.PhoneNumber, canonicalParticipant) ||
-                    JidsMatchCanonical(member.Lid, canonicalParticipant))
-                {
-                    return member.AvatarUrl;
-                }
-            }
-
-            return null;
-        }
-
-        private string FindAvatarOnDirectChat(string canonicalParticipant)
-        {
-            if (_whatsAppService?.Chats == null || string.IsNullOrWhiteSpace(canonicalParticipant))
-            {
-                return null;
-            }
-
-            foreach (var chat in _whatsAppService.Chats)
-            {
-                if (chat == null || chat.IsGroup || string.IsNullOrWhiteSpace(chat.JID))
-                {
-                    continue;
-                }
-
-                if (!JidsMatchCanonical(chat.JID, canonicalParticipant))
-                {
-                    continue;
-                }
-
-                string url = chat.GetAvatarUrl(preferHigh: false);
-                if (!string.IsNullOrWhiteSpace(url))
-                {
-                    return url;
-                }
-            }
-
-            return null;
-        }
-
-        private string FindAvatarOnPerson(string canonical, string participantJid)
-        {
-            if (_personStore == null)
-            {
-                return null;
-            }
-
-            Person person = _personStore.TryGetCached(canonical);
-            if (person == null &&
-                !string.Equals(canonical, participantJid, StringComparison.OrdinalIgnoreCase))
-            {
-                person = _personStore.TryGetCached(participantJid);
-            }
-
-            return string.IsNullOrWhiteSpace(person?.AvatarUrl) ? null : person.AvatarUrl;
-        }
-
-        private void EnsureGroupSenderName(ChatMessage message)
-        {
-            if (message == null || message.IsFromMe)
-            {
-                return;
-            }
-
-            if (!string.IsNullOrWhiteSpace(message.SenderName) &&
-                !string.Equals(message.SenderName, "Me", StringComparison.OrdinalIgnoreCase) &&
-                !string.Equals(message.SenderName, "You", StringComparison.OrdinalIgnoreCase))
-            {
-                return;
-            }
-
-            string participant = message.ParticipantJid;
-            if (string.IsNullOrWhiteSpace(participant))
-            {
-                return;
-            }
-
-            string resolved = _whatsAppService?.ResolveDisplayName(participant, "sender");
-            if (!string.IsNullOrWhiteSpace(resolved))
-            {
-                message.SenderName = resolved;
-            }
-        }
-
-        private static bool IsSameMessageRun(ChatMessage left, ChatMessage right)
-        {
-            if (left == null || right == null)
+            if (string.IsNullOrWhiteSpace(quotedId) || Messages == null || Messages.Count == 0)
             {
                 return false;
             }
 
-            if (left.IsFromMe != right.IsFromMe)
+            for (int i = 0; i < Messages.Count; i++)
             {
-                return false;
+                ChatMessage row = Messages[i]?.Model;
+                if (row != null &&
+                    string.Equals(row.Id, quotedId, StringComparison.Ordinal) &&
+                    row.IsFromMe)
+                {
+                    return true;
+                }
             }
 
-            if (left.IsFromMe)
-            {
-                return true;
-            }
-
-            string leftParticipant = left.ParticipantJid ?? string.Empty;
-            string rightParticipant = right.ParticipantJid ?? string.Empty;
-            if (!string.IsNullOrEmpty(leftParticipant) && !string.IsNullOrEmpty(rightParticipant))
-            {
-                return string.Equals(leftParticipant, rightParticipant, StringComparison.OrdinalIgnoreCase);
-            }
-
-            return string.Equals(left.SenderName ?? string.Empty, right.SenderName ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+            return false;
         }
+
     }
 }
