@@ -62,7 +62,7 @@ Chat list rows are the exception: they bind `ChatItem` directly and read local s
 
 Do not `new ChatMessageViewModel(...)` from a view. Use the factory from DI.
 Before dropping a bubble from a collection, call `Detach()` (via `ChatDetailViewModel.ClearTimeline` / `RemoveTimelineAt`) so `Model.PropertyChanged` does not keep the VM alive.
-Open only a small UI window (`InitialUiMessageWindow` 50); SQLite open page is 100 (`MessageFacade.SqlOpenPageSize`). Grow via top-scroll when `CanLoadMore` (code-behind checks scroll offset ≈ 0, ViewModel owns load-more / paging). Cap with `MaxUiMessageWindow`.
+Open only a small UI window (`InitialUiMessageWindow` / `MaxUiMessageWindow` from `SyncWorkloadStrategy`: 30/80 on Unsupported+Low, 50/150 on High); SQLite open page is 100 (`MessageFacade.SqlOpenPageSize`). Grow via top-scroll when `CanLoadMore` (code-behind checks scroll offset ≈ 0, ViewModel owns load-more / paging).
 
 Whoever mutates `ChatDetailViewModel.Messages` is the ViewModel — merge, dedupe, ordered insert, group-JID stamp, preview fallback and trim are its methods (`MergeTimelineFromService`, `InsertTimelineMessage`, `ApplyPreviewFallback`, `StampGroupRemoteJid`). Code-behind may read the collection and drive scroll, run layout and the pinned banner, but must not insert or remove rows itself.
 
@@ -95,18 +95,23 @@ Host a **control** (`*Control` : `UserControl`) only when it is reused or is a r
 ## 3. UI folders
 
 ```
-src/Unison.Uwp/UI/
-  Views/              pages (`*View`) and nested surfaces that are real child views (chat list/detail)
-  Controls/           reusable pieces (avatar, setting box, bubbles chrome, chat-info panes:
+src/Unison.Uwp/
+  Shell/
+    Unison/Views/     shell-specific pages (SettingsView today)
+    WhatsApp/Views/   shell-specific pages (SettingsView; may become dialog later)
+  UI/
+    Views/            shared pages (`*View`) and nested surfaces (chat list/detail)
+    Controls/         reusable pieces (avatar, setting box, bubbles chrome, chat-info panes:
                       ChatDetailInfoControl, ChatDetailUserInfoControl, ChatDetailGroupInfoControl,
                       ChatDetailGroupMemberInfoPane, ChatDetailGroupMemberInfoControl, ChatInfoMedia*)
-  Dialogs/            ContentDialog XAML only
-  Converters/         IValueConverter
-  Templates/          DataTemplates (messages, chat items, preview kinds)
-  TemplateSelectors/  DataTemplateSelector
-  Helpers/            view-only helpers (rich text, presentation)
+    Dialogs/            ContentDialog XAML only
+    Converters/         IValueConverter
+    Templates/          DataTemplates (messages, chat items, preview kinds)
+    TemplateSelectors/  DataTemplateSelector
+    Helpers/            view-only helpers (rich text, presentation)
 ```
 
+- **Shell-specific** page → `Shell/{Unison|WhatsApp}/`. Opened via the active `ShellThemeStrategy` map / `OpenSettings`.
 - **Reusable** visual → `Controls/`. Do not paste a second copy into a page.
 - **Dialog** → `Dialogs/` + a method on `IDialogService`. Views do not `new ContentDialog` for product flows.
 - **Converter** → `Converters/`. Do not put convert logic in the code-behind.
@@ -175,16 +180,20 @@ Do not grow `IWhatsAppService` for UI features. Add the member on the façade th
 
 `SocketBridge` implements `IWhatsAppSocket` so the client can keep working. New protocol features go on Socket use cases / modules, then a façade — not on `IWhatsAppSocket` unless the client still must see them.
 
+Core rules lifted out of the client live in `Unison.Core/Helpers/<Domain>/`, with the same folder names as `Services/WhatsApp/` (`Chats`, `Contacts`, `Groups`, `Messages`, `History`, `Connection`, `Status`, plus `Diagnostics`). The namespace stays `Unison.Core.Helpers`: the folders are for finding a rule, not module boundaries, because the rules call across domains. Generic helpers (`RelayCommand`, `Observable`, `JidHelper`, `UnixTime`, …) stay at the root.
+
 Text normalization: `ChatPreviewNormalizer.Normalize` is the **chat-list preview** (one line, 50-char cap). Message bodies and media captions — anything persisted or shown in a bubble — use `NormalizeBody`, which keeps the text whole and keeps line breaks.
 
 ---
 
 ## 7. Navigation, settings, i18n
 
-- Route **keys** in `Unison.Core/Constants/NavigationRoutes.cs`.
-- Page **types** only in `NavigatorService`. Core never names a view type.
+- Destination **enum** in Core: `NavigationDestination`. Pane string keys: `NavigationRoutes` (Tags / `ActiveSection`).
+- Page **types** only in `ShellThemeStrategy` / `NavigatorService`. Core never names a view type.
+- **Settings:** `INavigator.OpenSettings()` (explicit). Unison: `Shell/Unison/Views/SettingsView`. WhatsApp: `Shell/WhatsApp/Dialogs/SettingsDialog` (section UI in code-behind).
+- Other shell sections: `NavigateInShell(NavigationDestination.Chats|Archived|Status|Debug)`.
 - Auth boundaries: `NavigateAndClear` (Boot / Start / Login / AppShell). No back stack into login.
-- Master-detail stays on `ChatsView` / `StatusView` (not a Frame push list → detail).
+- Master-detail stays on `ChatsView` / `StatusView` (not a Frame push list → detail). Route pages such as `ArchivedChatsView` are separate shell pages with matching XAML (`x:Class`), not derived `Page` types loading a base `.xaml`.
 - Settings keys and defaults: `LocalSettingsConstants`. Do not invent a parallel key string; Background toasts that share a key must keep the **same literal**.
 - UI strings: `Strings/{tag}/Resources.resw` + `x:Uid` and/or `IStringResources`. English fallback for missing keys.
 - Shipped languages: `en-US`, `pt-BR`, `es-ES`, `it-IT`, `nl-NL`, `id-ID`, `pl-PL`, `uk-UA`, `ru-RU`. Add the key to **all** packs, or English-only with fallback — never a hardcoded sentence in a ViewModel.
@@ -201,7 +210,7 @@ Text normalization: `ChatPreviewNormalizer.Normalize` is the **chat-list preview
 - Features register on `NodeDispatcher`. Do not add a giant switch on `ConnectionHandler`.
 - Host seams go in `Unison.Socket/Abstractions/` (`IWaTransport`, `ISocketLog`, stores). UWP implements them.
 - Do not compile or “revive” `SocketClient.cs` / `PairingHandler.cs` (on disk, out of the csproj). Live path is `SocketBridge` → `WhatsAppSession`.
-- Do not implement `TransferSocketToBrokerAsync` as a fake success. Until the session can lend the transport, it returns `false`.
+- `TransferSocketToBrokerAsync` returns `true` only when the transport actually moved ownership; every failure answers `false` and the caller keeps the socket. Never report a handoff that did not happen.
 
 ---
 
@@ -240,7 +249,7 @@ These are hybrid **on purpose** until [Migration](Migration) says otherwise:
 - `WhatsAppService` still owns in-memory chats, history body, send transport, persist.
 - `ChatDetailView` code-behind still owns the message list host, scroll, and `MediaElement` chrome. Group run layout / date chips / author-avatar **resolve** lives on `ChatDetailViewModel.ApplyMessageRunLayout` (bubble only binds `ContactUri`). Midnight date-chip refresh is a view `DispatcherTimer`.
 - `ChatListView` may still mirror `VisibleChats` during initial-sync safe mode.
-- `SocketBridge` broker transfer / reclaim / cold restore return false / unused.
+- `SocketBridge` does not cold-restore a broker socket left by a terminated process; the next connect closes it and starts fresh.
 - `ChatsModule` in Socket is not instantiated by the bridge yet.
 - A few platform helpers still use `.Instance`; new code uses the interface.
 

@@ -16,6 +16,13 @@ namespace Unison.Core.ViewModels
         /// <summary>How long we wait for OnQRCodeReceived after ConnectAsync.</summary>
         private const int QrWaitTimeoutMs = 45000;
 
+        /// <summary>
+        /// Creators Update aborts MessageWebSocket before the QR stanza (~12s, 0x80072EFE).
+        /// A linked account reconnects; an unregistered pairing does not, so the first abort
+        /// became a dead error on the QR screen. Retry the connect before showing that.
+        /// </summary>
+        private const int PairingConnectAttempts = 3;
+
         private readonly IConnectionService _connection;
         private readonly IDispatcher _dispatcher;
         private readonly ISessionLogger _sessionLogger;
@@ -32,8 +39,6 @@ namespace Unison.Core.ViewModels
         private bool _isLogPanelVisible;
         private string _diagnosticLogText;
         private string _versionText;
-        private string _showLogButtonLabel;
-        private string _toggleLogButtonLabel;
         private bool _logLiveHooked;
         private bool _connectionHooked;
 
@@ -61,7 +66,6 @@ namespace Unison.Core.ViewModels
             DevResetSessionCommand = new RelayCommand(async () => await ResetSessionForDevAsync());
 
             _versionText = "v?";
-            RefreshLogButtonLabels();
 
             Attach();
         }
@@ -82,6 +86,7 @@ namespace Unison.Core.ViewModels
             _connection.QrExpired += Connection_QrExpired;
             _connection.StatusChanged += Connection_StatusChanged;
             _connection.Failed += Connection_Failed;
+            _connection.SessionEstablished += Connection_SessionEstablished;
             _connectionHooked = true;
         }
 
@@ -100,6 +105,7 @@ namespace Unison.Core.ViewModels
             _connection.QrExpired -= Connection_QrExpired;
             _connection.StatusChanged -= Connection_StatusChanged;
             _connection.Failed -= Connection_Failed;
+            _connection.SessionEstablished -= Connection_SessionEstablished;
             _connectionHooked = false;
         }
 
@@ -134,7 +140,19 @@ namespace Unison.Core.ViewModels
                 // QR should stop waiting, but it must not surface a cancellation on top of the
                 // message that already explains what happened.
                 _qrWaitTcs?.TrySetResult(null);
+                RaiseQrFullscreenDismissRequested();
             });
+        }
+
+        private void Connection_SessionEstablished(object sender, EventArgs e)
+        {
+            _sessionLogger.WriteAlways("[Pairing] Session established — dismiss QR preview if open");
+            _ = _dispatcher.RunAsync(RaiseQrFullscreenDismissRequested);
+        }
+
+        private void RaiseQrFullscreenDismissRequested()
+        {
+            QrFullscreenDismissRequested?.Invoke(this, EventArgs.Empty);
         }
 
         private void Connection_StatusChanged(object sender, string status)
@@ -215,13 +233,7 @@ namespace Unison.Core.ViewModels
         public bool IsLogPanelVisible
         {
             get => _isLogPanelVisible;
-            private set
-            {
-                if (Set(ref _isLogPanelVisible, value))
-                {
-                    RefreshLogButtonLabels();
-                }
-            }
+            private set => Set(ref _isLogPanelVisible, value);
         }
 
         public string DiagnosticLogText
@@ -230,17 +242,8 @@ namespace Unison.Core.ViewModels
             private set => Set(ref _diagnosticLogText, value);
         }
 
-        public string ShowLogButtonLabel
-        {
-            get => _showLogButtonLabel;
-            private set => Set(ref _showLogButtonLabel, value);
-        }
-
-        public string ToggleLogButtonLabel
-        {
-            get => _toggleLogButtonLabel;
-            private set => Set(ref _toggleLogButtonLabel, value);
-        }
+        /// <summary>Whether session logging is on (drives Enable/Disable log button Visibility).</summary>
+        public bool IsSessionLoggingEnabled => _sessionLogger != null && _sessionLogger.Enabled;
 
         /// <summary>Connects and waits for a QR payload (or times out).</summary>
         public ICommand StartPairingCommand { get; }
@@ -250,6 +253,11 @@ namespace Unison.Core.ViewModels
 
         /// <summary>Opens the current QR payload in a fullscreen preview dialog.</summary>
         public ICommand ShowQrFullscreenCommand { get; }
+
+        /// <summary>
+        /// Fullscreen QR dialog should close — pairing succeeded (device linked) or the code expired.
+        /// </summary>
+        public event EventHandler QrFullscreenDismissRequested;
 
         /// <summary>Shows or hides the full-screen diagnostic log overlay.</summary>
         public ICommand ToggleLogPanelCommand { get; }
@@ -267,7 +275,7 @@ namespace Unison.Core.ViewModels
                 return;
             }
 
-            await _dialogService.ShowQrFullscreenAsync(QRData);
+            await _dialogService.ShowQrFullscreenAsync(this);
         }
 
         public async Task ResetSessionForDevAsync()
@@ -296,7 +304,6 @@ namespace Unison.Core.ViewModels
 
             try
             {
-                RefreshLogButtonLabels();
                 RefreshDiagnosticLogText();
                 HookLiveLog();
             }
@@ -316,7 +323,7 @@ namespace Unison.Core.ViewModels
             {
                 bool enabled = !_sessionLogger.Enabled;
                 _sessionLogger.Enabled = enabled;
-                RefreshLogButtonLabels();
+                OnPropertyChanged(nameof(IsSessionLoggingEnabled));
                 DiagnosticLogText = enabled
                     ? _strings.Get("Login_LogEnabledHint", "Logging enabled.")
                     : _strings.Get("Login_LogDisabledHint", "Logging disabled.");
@@ -373,16 +380,6 @@ namespace Unison.Core.ViewModels
             }
         }
 
-        private void RefreshLogButtonLabels()
-        {
-            ShowLogButtonLabel = IsLogPanelVisible
-                ? _strings.Get("Login_ShowLogHide.Content", "Hide log")
-                : _strings.Get("Login_ShowLog.Content", "Show diagnostic log");
-            ToggleLogButtonLabel = _sessionLogger.Enabled
-                ? _strings.Get("Login_ToggleLogOff.Content", "Disable log")
-                : _strings.Get("Login_ToggleLogOn.Content", "Enable log");
-        }
-
         private void RaiseQrFullscreenCanExecuteChanged() =>
             _showQrFullscreenCommand?.RaiseCanExecuteChanged();
 
@@ -407,7 +404,35 @@ namespace Unison.Core.ViewModels
                     "reclaim do socket tambem e tipico.");
 
                 StatusText = Loc("Login_StatusConnecting", "Connecting to WhatsApp…");
-                await _connection.StartPairingAsync();
+                Exception connectFailure = null;
+                for (int attempt = 1; attempt <= PairingConnectAttempts; attempt++)
+                {
+                    try
+                    {
+                        _sessionLogger.WriteAlways(
+                            "[Pairing] StartPairing attempt " + attempt + "/" + PairingConnectAttempts);
+                        await _connection.StartPairingAsync();
+                        connectFailure = null;
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        connectFailure = ex;
+                        _sessionLogger.WriteErrorAlways(
+                            "[Pairing] StartPairing attempt " + attempt + " failed",
+                            ex);
+                        if (attempt < PairingConnectAttempts)
+                        {
+                            await Task.Delay(1500);
+                        }
+                    }
+                }
+
+                if (connectFailure != null)
+                {
+                    throw connectFailure;
+                }
+
                 _sessionLogger.WriteAlways(
                     "[Pairing] StartPairing returned; status=" +
                     (_connection.CurrentStatus ?? "(null)"));

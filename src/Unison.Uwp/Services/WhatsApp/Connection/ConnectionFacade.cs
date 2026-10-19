@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Unison.Core.Constants;
 using Unison.Core.Contracts;
 using Unison.Core.Contracts.WhatsApp;
+using Unison.Core.Helpers;
 using Unison.Core.Models;
 using Unison.Uwp.Services;
 using Unison.Uwp.Services.Socket;
@@ -23,6 +24,10 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
         private readonly IStringResources _strings;
         private readonly IWhatsAppSessionProvider _sessions;
         private readonly ILocalContactsService _localContacts;
+        private readonly IShortcutService _shortcuts;
+        private readonly ILiveTilesService _liveTiles;
+        private readonly IShellThemeService _shellTheme;
+        private readonly IStartupUiHost _startupUi;
         private IWhatsAppService _whatsApp;
         private int _handlingRelink;
 
@@ -31,13 +36,21 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
             INotificationService notificationService,
             IStringResources strings,
             IWhatsAppSessionProvider sessions,
-            ILocalContactsService localContacts)
+            ILocalContactsService localContacts,
+            IShortcutService shortcuts,
+            ILiveTilesService liveTiles,
+            IShellThemeService shellTheme,
+            IStartupUiHost startupUi)
         {
             _localSettings = localSettings ?? throw new ArgumentNullException(nameof(localSettings));
             _notificationService = notificationService ?? throw new ArgumentNullException(nameof(notificationService));
             _strings = strings ?? throw new ArgumentNullException(nameof(strings));
             _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
             _localContacts = localContacts;
+            _shortcuts = shortcuts ?? throw new ArgumentNullException(nameof(shortcuts));
+            _liveTiles = liveTiles ?? throw new ArgumentNullException(nameof(liveTiles));
+            _shellTheme = shellTheme ?? throw new ArgumentNullException(nameof(shellTheme));
+            _startupUi = startupUi ?? throw new ArgumentNullException(nameof(startupUi));
         }
 
         public event EventHandler<ConnectionEndedEventArgs> ConnectionEnded;
@@ -69,6 +82,89 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
         public bool AutoUnlinkOnLogoutEnabled =>
             _localSettings.Get<bool>(LocalSettingsConstants.AutoUnlinkOnLogoutEnabled);
 
+        // ---------------------------------------------------------------------
+        // Startup
+        //
+        // Forwarding, and deliberately so: the shell drives launch in a fixed order and needs one
+        // thing to drive it through. Until the socket moves here (phase 4) the client is still
+        // what answers, but the shell no longer has to know that.
+        //
+        // A missing client is treated as "not connected, not registered, nothing saved" rather
+        // than as an error. The facade is built before the client is attached, and a screen that
+        // asks in that window should fall through to pairing, not throw.
+        // ---------------------------------------------------------------------
+
+        public bool IsConnected
+        {
+            get
+            {
+                var whatsApp = _whatsApp;
+                return whatsApp != null && whatsApp.IsConnected;
+            }
+        }
+
+        public Task InitializeConnectionStateAsync()
+        {
+            var whatsApp = _whatsApp;
+            return whatsApp == null ? Task.CompletedTask : whatsApp.InitializeConnectionStateAsync();
+        }
+
+        public Task<bool> IsRegisteredAsync()
+        {
+            var whatsApp = _whatsApp;
+            return whatsApp == null ? Task.FromResult(false) : whatsApp.IsRegisteredAsync();
+        }
+
+        public Task EnsureConnectedAsync(int timeoutMs = 35000, bool forceFreshTransport = false)
+        {
+            var whatsApp = _whatsApp;
+            return whatsApp == null
+                ? Task.CompletedTask
+                : whatsApp.EnsureConnectedAsync(timeoutMs, forceFreshTransport);
+        }
+
+        public Task LoadPersistedUiStateAsync()
+        {
+            return _startupUi == null ? Task.CompletedTask : _startupUi.LoadPersistedUiStateAsync();
+        }
+
+        public void StartDeferredStartupMaintenance()
+        {
+            _startupUi?.StartDeferredStartupMaintenance();
+        }
+
+        public Task ResumeAsync()
+        {
+            var whatsApp = _whatsApp;
+            return whatsApp == null ? Task.CompletedTask : whatsApp.ResumeAsync();
+        }
+
+        public Task ReleaseMemoryAsync()
+        {
+            var whatsApp = _whatsApp;
+            return whatsApp == null ? Task.CompletedTask : whatsApp.ReleaseMemoryAsync();
+        }
+
+        public Task<bool> TransferActiveSocketToBrokerAsync(string reason)
+        {
+            var whatsApp = _whatsApp;
+            return whatsApp == null
+                ? Task.FromResult(false)
+                : whatsApp.TransferActiveSocketToBrokerAsync(reason);
+        }
+
+        public Task PrepareForSuspendAsync()
+        {
+            var whatsApp = _whatsApp;
+            return whatsApp == null ? Task.CompletedTask : whatsApp.PrepareForSuspendAsync();
+        }
+
+        public Task ShutdownAsync(bool persist = true)
+        {
+            var whatsApp = _whatsApp;
+            return whatsApp == null ? Task.CompletedTask : whatsApp.ShutdownAsync(persist);
+        }
+
         public void AttachWhatsAppService(IWhatsAppService whatsApp)
         {
             if (ReferenceEquals(_whatsApp, whatsApp))
@@ -81,7 +177,7 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
             HookClient(whatsApp);
         }
 
-        public void NotifyStreamError(string code)
+        private void NotifyStreamError(string code)
         {
             EvaluateAndMaybeUnlink(ClassifyStreamError(code), code, "stream-error");
         }
@@ -92,7 +188,7 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
         /// for deleting credentials that the phone may still consider perfectly valid. It stops
         /// the reconnect loop and leaves the decision to unlink with the user.
         /// </summary>
-        public void NotifySuspectedInvalidSession(string trigger)
+        private void NotifySuspectedInvalidSession(string trigger)
         {
             EvaluateAndMaybeUnlink(DisconnectReason.BadSession, "500", trigger ?? "suspected-invalid");
         }
@@ -153,6 +249,43 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
                 {
                     Debug.WriteLine("[ConnectionFacade] Clearing Windows People list failed: " + ex.Message);
                 }
+            }
+
+            await AutoRestoreDefaultAsync().ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Puts the device back to a fresh Unison after the account is gone: the Start
+        /// shortcuts this app created, the primary live tile, and the shell theme.
+        /// Called for a disconnect the user asked for and for one the phone imposed.
+        /// </summary>
+        private async Task AutoRestoreDefaultAsync()
+        {
+            try
+            {
+                await _shortcuts.UnpinAllChatsAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("[ConnectionFacade] Unpinning Start tiles failed: " + ex.Message);
+            }
+
+            try
+            {
+                _liveTiles.Clear();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("[ConnectionFacade] Clearing the live tile failed: " + ex.Message);
+            }
+
+            try
+            {
+                await _shellTheme.ChangeShellAndRestartAsync(AppShell.Unison).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("[ConnectionFacade] Restoring the Unison shell failed: " + ex.Message);
             }
         }
 
@@ -266,6 +399,8 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
                 {
                     Debug.WriteLine("[ConnectionFacade] Logged-out toast failed: " + toastEx.Message);
                 }
+
+                await AutoRestoreDefaultAsync().ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -375,6 +510,8 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
             whatsApp.OnSessionInitialized += Client_OnSessionInitialized;
             whatsApp.OnSessionCleared += Client_OnSessionCleared;
             whatsApp.OnError += Client_OnError;
+            whatsApp.OnStreamError += Client_OnStreamError;
+            whatsApp.OnInvalidSessionSuspected += Client_OnInvalidSessionSuspected;
         }
 
         private void UnhookClient(IWhatsAppService whatsApp)
@@ -390,6 +527,18 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
             whatsApp.OnSessionInitialized -= Client_OnSessionInitialized;
             whatsApp.OnSessionCleared -= Client_OnSessionCleared;
             whatsApp.OnError -= Client_OnError;
+            whatsApp.OnStreamError -= Client_OnStreamError;
+            whatsApp.OnInvalidSessionSuspected -= Client_OnInvalidSessionSuspected;
+        }
+
+        private void Client_OnStreamError(object sender, string code)
+        {
+            NotifyStreamError(code);
+        }
+
+        private void Client_OnInvalidSessionSuspected(object sender, string trigger)
+        {
+            NotifySuspectedInvalidSession(trigger);
         }
 
         private void Client_OnQrCodeReceived(object sender, string qr)
@@ -439,13 +588,8 @@ namespace Unison.Uwp.Services.WhatsApp.Connection
             }
         }
 
-        private static bool IsRelinkReason(DisconnectReason reason)
-        {
-            return reason == DisconnectReason.LoggedOut ||
-                   reason == DisconnectReason.ConnectionReplaced ||
-                   reason == DisconnectReason.BadSession ||
-                   reason == DisconnectReason.Forbidden;
-        }
+        private static bool IsRelinkReason(DisconnectReason reason) =>
+            RelinkDisconnectReason.Matches(reason);
 
         private static string Describe(DisconnectReason reason, string code)
         {

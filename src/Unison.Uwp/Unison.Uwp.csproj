@@ -42,6 +42,9 @@
     <AppxOSMinVersionReplaceManifestVersion>false</AppxOSMinVersionReplaceManifestVersion>
     <AppxOSMaxVersionTestedReplaceManifestVersion>false</AppxOSMaxVersionTestedReplaceManifestVersion>
     <LangVersion>preview</LangVersion>
+    <!-- Debug turns on reflection XamlTypeInfo, which registers System.Windows.Input.ICommand
+         again even though the Windows SDK already includes it. -->
+    <EnableTypeInfoReflection>false</EnableTypeInfoReflection>
     <AppxPackageSigningTimestampDigestAlgorithm>SHA256</AppxPackageSigningTimestampDigestAlgorithm>
     <GenerateTestArtifacts>False</GenerateTestArtifacts>
     <HoursBetweenUpdateChecks>0</HoursBetweenUpdateChecks>
@@ -132,25 +135,47 @@
     </Compile>
     <Compile Include="Helpers\LocalizedStrings.cs" />
     <Compile Include="Helpers\SelfChatDisplayHelper.cs" />
+    <Compile Include="Helpers\SelfMarkerNaming.cs" />
     <Compile Include="Helpers\LocalSettingsAccess.cs" />
+    <Compile Include="Helpers\WebPHelpers.cs" />
+    <Compile Include="Helpers\WebPDecoder.cs" />
     <Compile Include="Services\DispatcherService.cs" />
     <Compile Include="Services\UiThreadDispatcherService.cs" />
+    <Compile Include="Services\AttachedUiDispatcher.cs" />
     <Compile Include="Services\DialogService.cs" />
+    <Compile Include="Services\MediaDiskUsageService.cs" />
+    <Compile Include="Services\StartTileMarkAssets.cs" />
+    <Compile Include="Services\StartTileMirror.cs" />
+    <Compile Include="Services\StartTilePinService.cs" />
+    <Compile Include="Services\AvatarCacheService.cs" />
+    <Compile Include="Services\MediaCacheService.cs" />
+    <Compile Include="Services\MediaDerivationService.cs" />
+    <Compile Include="Services\MediaDownloadGate.cs" />
+    <Compile Include="Services\WhatsApp\Messages\ReceiptReader.cs" />
+    <Compile Include="Services\UsyncGate.cs" />
+    <Compile Include="Services\WhatsApp\Contacts\AvatarFetcher.cs" />
     <Compile Include="Services\LocalSettingsService.cs" />
     <Compile Include="Services\Socket\WaTransportAdapter.cs" />
     <Compile Include="Services\Socket\IWhatsAppSessionProvider.cs" />
+    <Compile Include="Services\WhatsApp\JidResolver.cs" />
     <Compile Include="Services\WhatsApp\Connection\ConnectionFacade.cs" />
     <Compile Include="Services\WhatsApp\Contacts\ContactFacade.cs" />
     <Compile Include="Services\WhatsApp\Contacts\AddressBookOverlay.cs" />
     <Compile Include="Services\WhatsApp\Contacts\ChatAvatarPolicy.cs" />
+    <Compile Include="Services\WhatsApp\Contacts\ChatAvatarFetch.cs" />
     <Compile Include="Services\WhatsApp\Contacts\GroupRosterPolicy.cs" />
     <Compile Include="Services\WhatsApp\Contacts\ContactDirectory.cs" />
     <Compile Include="Services\WhatsApp\Contacts\ContactNameResolver.cs" />
+    <Compile Include="Services\WhatsApp\Contacts\ContactUsyncResolver.cs" />
     <Compile Include="Services\WhatsApp\Chats\ChatFacade.cs" />
+    <Compile Include="Services\WhatsApp\Chats\ChatPreviewReconciler.cs" />
+    <Compile Include="Services\WhatsApp\Groups\GroupFacade.cs" />
+    <Compile Include="Services\WhatsApp\Groups\GroupMetadataReader.cs" />
     <Compile Include="Services\WhatsApp\History\HistoryFacade.cs" />
     <Compile Include="Services\WhatsApp\History\HistoryThumbnailMaterializer.cs" />
     <Compile Include="Services\WhatsApp\Status\StatusFacade.cs" />
     <Compile Include="Services\WhatsApp\Messages\MessageFacade.cs" />
+    <Compile Include="Services\WhatsApp\Messages\MediaAvailability.cs" />
     <Compile Include="Services\WhatsApp\Profiles\ProfileFacade.cs" />
     <Compile Include="Services\Socket\DelegateSocketLog.cs" />
     <Compile Include="Services\Socket\SocketSliceProbe.cs" />
@@ -163,11 +188,55 @@
     <Compile Include="Services\SystemInfoProvider.cs" />
     <Compile Include="Services\StatusBarService.cs" />
     <Compile Include="Services\LocationKeepAliveService.cs" />
+    <Compile Include="Services\DisplayKeepAwakeService.cs" />
     <Compile Include="Services\ShellThemeService.cs" />
     <Compile Include="Services\AppLanguageService.cs" />
+    <Compile Include="Services\Themes\IShellNavigationStrategy.cs" />
     <Compile Include="Services\Themes\ShellThemeStrategy.cs" />
     <Compile Include="Services\Themes\UnisonThemeStrategy.cs" />
     <Compile Include="Services\Themes\WhatsAppThemeStrategy.cs" />
+    <Compile Include="Services\Themes\WhatsAppLegacyThemeStrategy.cs" />
+    <Compile Include="Shell\WhatsAppLegacy\Views\ShellView.xaml.cs">
+      <DependentUpon>ShellView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\LegacyChatDetailInfoControl.xaml.cs">
+      <DependentUpon>LegacyChatDetailInfoControl.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\LegacyImageViewerView.xaml.cs">
+      <DependentUpon>LegacyImageViewerView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\LegacyCommandBarLayout.cs" />
+    <Compile Include="Shell\WhatsAppLegacy\Views\LegacyProfileSecondary.cs" />
+    <Compile Include="Shell\WhatsAppLegacy\Views\LegacySectionAppBar.xaml.cs">
+      <DependentUpon>LegacySectionAppBar.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\ChatDetailView.xaml.cs">
+      <DependentUpon>ChatDetailView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\LegacyPivotPlaceholderView.xaml.cs">
+      <DependentUpon>LegacyPivotPlaceholderView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\ChatsView.xaml.cs">
+      <DependentUpon>ChatsView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\ArchivedChatsView.xaml.cs">
+      <DependentUpon>ArchivedChatsView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\StatusView.xaml.cs">
+      <DependentUpon>StatusView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\DebugView.xaml.cs">
+      <DependentUpon>DebugView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\ChatListView.xaml.cs">
+      <DependentUpon>ChatListView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\StatusListView.xaml.cs">
+      <DependentUpon>StatusListView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsAppLegacy\Views\SettingsView.xaml.cs">
+      <DependentUpon>SettingsView.xaml</DependentUpon>
+    </Compile>
     <Compile Include="MainView.xaml.cs">
       <DependentUpon>MainView.xaml</DependentUpon>
     </Compile>
@@ -176,6 +245,7 @@
     <!-- Client components -->
     <Compile Include="Client\IWhatsAppSocket.cs" />
     <Compile Include="Client\SocketBridge.cs" />
+    <Compile Include="Client\QuotedMessageStub.cs" />
     <Compile Include="Client\SocketContracts.cs" />
     <Compile Include="Client\AuthStore.cs" />
     <Compile Include="Client\FileKeyStore.cs" />
@@ -190,8 +260,12 @@
     <Compile Include="Services\AppLifecycleService.cs" />
     <Compile Include="Services\UriLauncherService.cs" />
     <Compile Include="Services\FilePickerService.cs" />
+    <Compile Include="Services\CopyService.cs" />
+    <Compile Include="Services\AudioExportService.cs" />
+    <Compile Include="UI\Controls\ChatAudioOverflowMenu.cs" />
     <Compile Include="Services\ShareService.cs" />
     <Compile Include="Services\AudioRecordingService.cs" />
+    <Compile Include="Services\UiSoundService.cs" />
     <Compile Include="Services\VoicePlaybackRoutingService.cs" />
     <Compile Include="Services\WhatsApp\WhatsAppService.cs" />
     <Compile Include="Services\WhatsApp\WhatsAppService.Connection.cs" />
@@ -199,11 +273,13 @@
     <Compile Include="Services\WhatsApp\WhatsAppService.Groups.cs" />
     <Compile Include="Services\WhatsApp\WhatsAppService.Avatars.cs" />
     <Compile Include="Services\WhatsApp\WhatsAppService.StartupPhases.cs" />
+    <Compile Include="Services\WhatsApp\StartupPhaseTrace.cs" />
     <Compile Include="Services\WhatsApp\WhatsAppService.Identity.cs" />
     <Compile Include="Services\WhatsApp\WhatsAppService.AppState.cs" />
     <Compile Include="Services\WhatsApp\WhatsAppService.Persistence.cs" />
     <Compile Include="Services\WhatsApp\WhatsAppService.Receipts.cs" />
     <Compile Include="Services\WhatsApp\WhatsAppService.IncomingPump.cs" />
+    <Compile Include="Services\WhatsApp\WhatsAppService.OutgoingHost.cs" />
     <Compile Include="Services\WhatsApp\Diagnostics\DebugSendService.cs" />
     <Compile Include="Services\LocalContactsService.cs" />
     <Compile Include="Services\WindowsContactListPublisher.cs" />
@@ -211,16 +287,20 @@
     <Compile Include="Services\LiveTilesService.cs" />
     <Compile Include="Services\ShortcutService.cs" />
     <Compile Include="Services\RuntimeDiagnosticsService.cs" />
+    <Compile Include="Services\VerboseLog.cs" />
     <Compile Include="Data\MessageStore.cs" />
     <Compile Include="Data\PersonStore.cs" />
+    <Compile Include="Data\GroupRosterStore.cs" />
     <Compile Include="Data\ChatStore.cs" />
     <Compile Include="Data\HistoryMigrationStore.cs" />
     <Compile Include="Data\HistoryChatPreviewStore.cs" />
+    <Compile Include="Data\StaleOutgoingSweep.cs" />
     <Compile Include="Data\HistoryMessageStore.cs" />
     <Compile Include="Data\HistoryStatusStore.cs" />
     <Compile Include="Data\SqliteLidMappingStorage.cs" />
     <Compile Include="Data\Entities\PersonRow.cs" />
     <Compile Include="Data\Entities\PersonGroupRow.cs" />
+    <Compile Include="Data\Entities\GroupRosterMemberRow.cs" />
     <Compile Include="Data\Entities\ChatRow.cs" />
     <Compile Include="Data\Entities\HistoryMigrationRow.cs" />
     <Compile Include="Data\Entities\HistoryChatPreviewRow.cs" />
@@ -246,8 +326,29 @@
     <Compile Include="UI\Controls\MessageBubbleChrome.xaml.cs">
       <DependentUpon>MessageBubbleChrome.xaml</DependentUpon>
     </Compile>
+    <Compile Include="UI\Controls\LegacyMessageBubbleChrome.xaml.cs">
+      <DependentUpon>LegacyMessageBubbleChrome.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\UnisonMessageBubbleChrome.xaml.cs">
+      <DependentUpon>UnisonMessageBubbleChrome.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\MessageBubbleChromeHost.xaml.cs">
+      <DependentUpon>MessageBubbleChromeHost.xaml</DependentUpon>
+    </Compile>
     <Compile Include="UI\Controls\SettingBox.xaml.cs">
       <DependentUpon>SettingBox.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\ProfileBox.xaml.cs">
+      <DependentUpon>ProfileBox.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\ProfilePhotoButton.xaml.cs">
+      <DependentUpon>ProfilePhotoButton.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\ProfileSettingsControl.xaml.cs">
+      <DependentUpon>ProfileSettingsControl.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\WhatsAppProfileControl.xaml.cs">
+      <DependentUpon>WhatsAppProfileControl.xaml</DependentUpon>
     </Compile>
     <Compile Include="UI\Controls\AboutControl.xaml.cs">
       <DependentUpon>AboutControl.xaml</DependentUpon>
@@ -270,8 +371,25 @@
     <Compile Include="UI\Views\ChatsView.xaml.cs">
       <DependentUpon>ChatsView.xaml</DependentUpon>
     </Compile>
-    <Compile Include="UI\Views\SettingsView.xaml.cs">
+    <Compile Include="UI\Views\ArchivedChatsView.xaml.cs">
+      <DependentUpon>ArchivedChatsView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Views\IConversationShellPage.cs" />
+    <Compile Include="UI\Views\IChatDetailSurface.cs" />
+    <Compile Include="Shell\Unison\Views\ChatsView.xaml.cs">
+      <DependentUpon>ChatsView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\Unison\Views\ArchivedChatsView.xaml.cs">
+      <DependentUpon>ArchivedChatsView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\Unison\Views\ChatDetailView.xaml.cs">
+      <DependentUpon>ChatDetailView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\Unison\Views\SettingsView.xaml.cs">
       <DependentUpon>SettingsView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Shell\WhatsApp\Dialogs\SettingsDialog.xaml.cs">
+      <DependentUpon>SettingsDialog.xaml</DependentUpon>
     </Compile>
     <Compile Include="UI\Views\DebugView.xaml.cs">
       <DependentUpon>DebugView.xaml</DependentUpon>
@@ -291,8 +409,23 @@
     <Compile Include="UI\Views\StatusDetailView.xaml.cs">
       <DependentUpon>StatusDetailView.xaml</DependentUpon>
     </Compile>
+    <Compile Include="UI\Views\CallsView.xaml.cs">
+      <DependentUpon>CallsView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Views\FavoritesView.xaml.cs">
+      <DependentUpon>FavoritesView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\CallsEmptyControl.xaml.cs">
+      <DependentUpon>CallsEmptyControl.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\FavoritesEmptyControl.xaml.cs">
+      <DependentUpon>FavoritesEmptyControl.xaml</DependentUpon>
+    </Compile>
     <Compile Include="UI\Views\ImageViewerView.xaml.cs">
       <DependentUpon>ImageViewerView.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Views\CameraPickView.xaml.cs">
+      <DependentUpon>CameraPickView.xaml</DependentUpon>
     </Compile>
     <Compile Include="UI\Views\VideoViewerView.xaml.cs">
       <DependentUpon>VideoViewerView.xaml</DependentUpon>
@@ -302,11 +435,15 @@
     <Compile Include="UI\Templates\ChatItemTemplates.xaml.cs">
       <DependentUpon>ChatItemTemplates.xaml</DependentUpon>
     </Compile>
+    <Compile Include="UI\Templates\IChatRowActions.cs" />
     <Compile Include="UI\Templates\MessageTemplates.xaml.cs">
       <DependentUpon>MessageTemplates.xaml</DependentUpon>
     </Compile>
+    <Compile Include="UI\Triggers\WindowWidthRangeTrigger.cs" />
     <Compile Include="UI\Helpers\ChatPreviewKindPresentation.cs" />
     <Compile Include="UI\Helpers\CommentRichService.cs" />
+    <Compile Include="UI\Helpers\MentionComposerInput.cs" />
+    <Compile Include="UI\Helpers\MessageBubbleContextActions.cs" />
     <Compile Include="UI\Helpers\DesktopCursor.cs" />
     <Compile Include="UI\Helpers\DesktopCursorKind.cs" />
     <Compile Include="UI\Helpers\RichTextBuilder.cs" />
@@ -326,12 +463,57 @@
     <Compile Include="UI\Controls\ChatAvatarControl.xaml.cs">
       <DependentUpon>ChatAvatarControl.xaml</DependentUpon>
     </Compile>
+    <Compile Include="UI\Controls\StatusListAvatarControl.xaml.cs">
+      <DependentUpon>StatusListAvatarControl.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Converters\ChatMessageKindVisibilityConverter.cs" />
+    <Compile Include="UI\Controls\Reply\ReplyComposeBar.xaml.cs">
+      <DependentUpon>ReplyComposeBar.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\Reply\ReplyTextChrome.xaml.cs">
+      <DependentUpon>ReplyTextChrome.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\Reply\ReplyImageChrome.xaml.cs">
+      <DependentUpon>ReplyImageChrome.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\Reply\ReplyVideoChrome.xaml.cs">
+      <DependentUpon>ReplyVideoChrome.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\Reply\ReplyStickerChrome.xaml.cs">
+      <DependentUpon>ReplyStickerChrome.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\Reply\ReplyAudioChrome.xaml.cs">
+      <DependentUpon>ReplyAudioChrome.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\Reply\ReplyDocumentChrome.xaml.cs">
+      <DependentUpon>ReplyDocumentChrome.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\MentionSuggestList.xaml.cs">
+      <DependentUpon>MentionSuggestList.xaml</DependentUpon>
+    </Compile>
     <Compile Include="UI\Controls\ChatDateSeparator.xaml.cs">
       <DependentUpon>ChatDateSeparator.xaml</DependentUpon>
     </Compile>
     <Compile Include="UI\Controls\ChatAudioBubbleBar.xaml.cs">
       <DependentUpon>ChatAudioBubbleBar.xaml</DependentUpon>
     </Compile>
+    <Compile Include="UI\Controls\UnisonChatAudioBubbleBar.xaml.cs">
+      <DependentUpon>UnisonChatAudioBubbleBar.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\ChatAudioBubbleBarHost.xaml.cs">
+      <DependentUpon>ChatAudioBubbleBarHost.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\UnisonMediaCircleButton.xaml.cs">
+      <DependentUpon>UnisonMediaCircleButton.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\ChatMediaCircleButtonHost.xaml.cs">
+      <DependentUpon>ChatMediaCircleButtonHost.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Controls\ChatAudioTransportPresenter.cs" />
+    <Compile Include="UI\Controls\ChatMediaPlaceholderHost.cs" />
+    <Compile Include="UI\Controls\ShellUi.cs" />
+    <Compile Include="UI\Controls\LegacyMediaGlyphs.cs" />
+    <Compile Include="UI\Controls\LegacyInfoText.cs" />
     <Compile Include="UI\Controls\ChatDetailInfoControl.xaml.cs">
       <DependentUpon>ChatDetailInfoControl.xaml</DependentUpon>
     </Compile>
@@ -373,8 +555,17 @@
     <Compile Include="UI\Dialogs\ImageSendPreviewDialog.xaml.cs">
       <DependentUpon>ImageSendPreviewDialog.xaml</DependentUpon>
     </Compile>
+    <Compile Include="UI\Dialogs\DocumentSendPreviewDialog.xaml.cs">
+      <DependentUpon>DocumentSendPreviewDialog.xaml</DependentUpon>
+    </Compile>
     <Compile Include="UI\Dialogs\ReactionsDialog.xaml.cs">
       <DependentUpon>ReactionsDialog.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Dialogs\StartTileMarkDialog.xaml.cs">
+      <DependentUpon>StartTileMarkDialog.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="UI\Dialogs\RuntimeDiagnosticsDialog.xaml.cs">
+      <DependentUpon>RuntimeDiagnosticsDialog.xaml</DependentUpon>
     </Compile>
     <Compile Include="Client\MediaUtils.cs" />
     <Compile Include="Client\OggOpusHandlerService.cs" />
@@ -399,7 +590,29 @@
     <Content Include="Assets\Checkmarks\sent_message.png" />
     <Content Include="Assets\Toast\avatar_contact.png" />
     <Content Include="Assets\Toast\avatar_group.png" />
+    <Content Include="Assets\WhatsAppLegacy\default-contact-icon.png" />
+    <Content Include="Assets\WhatsAppLegacy\default-group-icon.png" />
+    <Content Include="Assets\WhatsAppLegacy\Icons\appbar-add.png" />
+    <Content Include="Assets\WhatsAppLegacy\Icons\appbar-search.png" />
+    <Content Include="Assets\WhatsAppLegacy\Icons\composer-attach.png" />
+    <Content Include="Assets\WhatsAppLegacy\Icons\composer-mic.png" />
+    <Content Include="Assets\WhatsAppLegacy\Icons\composer-send.png" />
+    <Content Include="Assets\Sounds\message_sent.mp3" />
+    <Content Include="Assets\Sounds\voice_note_start.wav" />
+    <Content Include="Assets\Sounds\voice_note_stop.wav" />
+    <Content Include="Assets\Sounds\voice_note_error.wav" />
     <Content Include="Properties\Default.rd.xml" />
+  </ItemGroup>
+  <!-- libwebp for W10M (ARM) only — must land at package root for DllImport("libwebp.dll"). -->
+  <ItemGroup Condition="'$(Platform)' == 'ARM'">
+    <Content Include="Native\WebP\ARM\libwebp.dll">
+      <Link>libwebp.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Native\WebP\ARM\libsharpyuv.dll">
+      <Link>libsharpyuv.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
   <ItemGroup>
     <Content Include="Assets\BadgeLogo.scale-100.png" />
@@ -425,6 +638,7 @@
     <Content Include="Assets\Fonts\SegUIVar.ttf" />
     <Content Include="Assets\Fonts\SegoeIcons.ttf" />
     <Content Include="Assets\Fonts\UnisonIcons.ttf" />
+    <Content Include="Assets\Fonts\WhatsAppLegacyIcons.ttf" />
     <Content Include="Assets\LargeTile.scale-100.png" />
     <Content Include="Assets\LargeTile.scale-125.png" />
     <Content Include="Assets\LargeTile.scale-150.png" />
@@ -446,6 +660,9 @@
     <Content Include="Assets\Square44x44Logo.altform-unplated_targetsize-16.png" />
     <Content Include="Assets\Square44x44Logo.altform-unplated_targetsize-24.png" />
     <Content Include="Assets\Square44x44Logo.altform-unplated_targetsize-256.png" />
+    <Content Include="Assets\Logo\BootLogo.png" />
+    <Content Include="Assets\Logo\LoginLogo_Unison.png" />
+    <Content Include="Assets\Logo\LoginLogo_WhatsApp.png" />
     <Content Include="Assets\Square44x44Logo.altform-unplated_targetsize-32.png" />
     <Content Include="Assets\Square44x44Logo.altform-unplated_targetsize-48.png" />
     <Content Include="Assets\Square44x44Logo.scale-100.png" />
@@ -471,6 +688,11 @@
     <Content Include="Assets\Wide310x150Logo.scale-150.png" />
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
     <Content Include="Assets\Wide310x150Logo.scale-400.png" />
+    <Content Include="Assets\SplashScreen.scale-100.png" />
+    <Content Include="Assets\WhatsAppLogo.png" />
+    <Content Include="Assets\Square44x44Logo.targetsize-20_altform-unplated.png" />
+    <Content Include="Assets\LegacyLogo\*.png" />
+    <Content Include="Assets\CustomTiles\*.png" />
   </ItemGroup>
   <ItemGroup>
     <ApplicationDefinition Include="App.xaml">
@@ -505,6 +727,18 @@
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
+    <Page Include="UI\Controls\LegacyMessageBubbleChrome.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\UnisonMessageBubbleChrome.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\MessageBubbleChromeHost.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
     <Page Include="UI\Controls\ChatListPreviewStrip.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
@@ -513,11 +747,63 @@
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
+    <Page Include="UI\Controls\StatusListAvatarControl.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\MentionSuggestList.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\Reply\ReplyComposeBar.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\Reply\ReplyTextChrome.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\Reply\ReplyImageChrome.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\Reply\ReplyVideoChrome.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\Reply\ReplyStickerChrome.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\Reply\ReplyAudioChrome.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\Reply\ReplyDocumentChrome.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
     <Page Include="UI\Controls\ChatDateSeparator.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
     <Page Include="UI\Controls\ChatAudioBubbleBar.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\UnisonChatAudioBubbleBar.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\ChatAudioBubbleBarHost.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\UnisonMediaCircleButton.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\ChatMediaCircleButtonHost.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
@@ -569,6 +855,22 @@
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
+    <Page Include="UI\Controls\ProfileBox.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\ProfilePhotoButton.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\ProfileSettingsControl.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\WhatsAppProfileControl.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
     <Page Include="UI\Controls\AboutControl.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
@@ -597,7 +899,79 @@
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
-    <Page Include="UI\Views\SettingsView.xaml">
+    <Page Include="UI\Views\ArchivedChatsView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\Unison\Views\ChatsView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\Unison\Views\ArchivedChatsView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\Unison\Views\ChatDetailView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\Unison\Views\SettingsView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\ShellView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\LegacyChatDetailInfoControl.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\ChatDetailView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\LegacyImageViewerView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\LegacySectionAppBar.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\LegacyPivotPlaceholderView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\ChatsView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\ArchivedChatsView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\StatusView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\DebugView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\ChatListView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\StatusListView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsAppLegacy\Views\SettingsView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Shell\WhatsApp\Dialogs\SettingsDialog.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
@@ -625,7 +999,27 @@
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
+    <Page Include="UI\Views\CallsView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Views\FavoritesView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\CallsEmptyControl.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Controls\FavoritesEmptyControl.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
     <Page Include="UI\Views\ImageViewerView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Views\CameraPickView.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
@@ -645,7 +1039,19 @@
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
+    <Page Include="UI\Dialogs\DocumentSendPreviewDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Dialogs\StartTileMarkDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
     <Page Include="UI\Dialogs\ReactionsDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="UI\Dialogs\RuntimeDiagnosticsDialog.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>
@@ -686,6 +1092,18 @@
       <SubType>Designer</SubType>
     </Page>
     <Page Include="Themes\WhatsApp\Theme.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Themes\WhatsAppLegacy\Theme.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Themes\WhatsAppLegacy\Chrome.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Themes\WhatsAppLegacy\Controls.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </Page>

@@ -26,12 +26,14 @@ namespace Unison.Core.ViewModels
         public const string PaneNarrowList = "NarrowList";
         public const string PaneNarrowDetail = "NarrowDetail";
 
-        private readonly IWhatsAppService _whatsAppService;
-
         /// <summary>The chat list, read from its owner rather than from the service that fills it.</summary>
         private readonly IChatStateStore _chatState;
 
+        /// <summary>Launch order, registration and the socket. The shell drives all three.</summary>
         private readonly IConnectionService _connectionService;
+
+        /// <summary>Only for the unread total behind the tile badge.</summary>
+        private readonly IChatService _chatService;
         private readonly IProfileService _profileService;
         private readonly IDispatcher _dispatcher;
         private readonly INotificationService _notificationService;
@@ -44,6 +46,9 @@ namespace Unison.Core.ViewModels
         private readonly ISessionLogger _sessionLogger;
         private readonly IBackgroundAccessPrompt _backgroundAccessPrompt;
 
+        /// <summary>Only for the startup address-book pass over the restored chat list.</summary>
+        private readonly IContactService _contactService;
+
         private bool _isPaneOpen;
         private string _currentUserName;
         private string _currentUserPhone;
@@ -53,6 +58,7 @@ namespace Unison.Core.ViewModels
         private string _chatPane = PaneWideBoth;
         private bool _isNarrowWindow;
         private bool _hasActiveChat;
+        private bool _statusDetailOpen;
         private ChatItem _pendingChat;
         private string _pendingOpenChatJid;
         private bool _initialized;
@@ -60,6 +66,7 @@ namespace Unison.Core.ViewModels
         private bool _startInProgress;
         private bool _startPairingOnLoginSurface = true;
         private double _chatListPaneWidth;
+        private readonly NotificationCounterWatch _notificationCounter;
 
         /// <summary>
         /// When true, Enter* / NavigateToAppShell update state but skip root Frame navigation
@@ -68,9 +75,9 @@ namespace Unison.Core.ViewModels
         public bool SuppressRootNavigation { get; set; }
 
         public ShellViewModel(
-            IWhatsAppService whatsAppService,
             IChatStateStore chatState,
             IConnectionService connectionService,
+            IChatService chatService,
             IProfileService profileService,
             IDispatcher dispatcher,
             INotificationService notificationService,
@@ -81,11 +88,12 @@ namespace Unison.Core.ViewModels
             IStringResources strings,
             ILocalSettings localSettings,
             ISessionLogger sessionLogger = null,
-            IBackgroundAccessPrompt backgroundAccessPrompt = null)
+            IBackgroundAccessPrompt backgroundAccessPrompt = null,
+            IContactService contactService = null)
         {
-            _whatsAppService = whatsAppService;
             _chatState = chatState ?? throw new ArgumentNullException(nameof(chatState));
-            _connectionService = connectionService;
+            _connectionService = connectionService ?? throw new ArgumentNullException(nameof(connectionService));
+            _chatService = chatService;
             _profileService = profileService;
             _dispatcher = dispatcher;
             _notificationService = notificationService;
@@ -97,14 +105,26 @@ namespace Unison.Core.ViewModels
             _localSettings = localSettings ?? throw new ArgumentNullException(nameof(localSettings));
             _sessionLogger = sessionLogger;
             _backgroundAccessPrompt = backgroundAccessPrompt;
+            _contactService = contactService;
 
             _chatListPaneWidth = ReadStoredChatListPaneWidth();
 
             TogglePaneCommand = new RelayCommand(() => IsPaneOpen = !IsPaneOpen);
             NavigateToSectionCommand = new RelayCommand<string>(NavigateToSection);
+            OpenProfileSettingsCommand = new RelayCommand(OpenProfileSettings);
 
             _navigator.ShellNavigated += Navigator_ShellNavigated;
+            _notificationCounter = new NotificationCounterWatch(_chatState.Chats);
+            _notificationCounter.Changed += (s, e) =>
+                RaiseProperties(nameof(NotificationCounterBadge), nameof(NotificationCounterBadgeText));
         }
+
+        /// <summary>How many chats have a notification. Same count the chat-list header shows.</summary>
+        public int NotificationCounterBadge => _notificationCounter?.Count ?? 0;
+
+        /// <summary>Parenthetical next to the Legacy brand, empty when nothing is unread.</summary>
+        public string NotificationCounterBadgeText =>
+            NotificationCounter.FormatBadge(NotificationCounterBadge);
 
         private void PairingTrace(string message)
         {
@@ -226,7 +246,21 @@ namespace Unison.Core.ViewModels
             set => Set(ref _activeSection, value);
         }
 
-        /// <summary>Startup | Login | Connected â€” maps to AppSurfaceStates.</summary>
+        /// <summary>
+        /// Legacy search box, Enter. The open pivot decides the target: chats and archived
+        /// write that list's query; the other pivots have nothing to search yet.
+        /// </summary>
+        public void InvokeFromPivotCommand(string pivotTag, string query, ChatListViewModel target)
+        {
+            if (!LegacyPivotSearch.AppliesToChatList(pivotTag) || target == null)
+            {
+                return;
+            }
+
+            target.SearchQuery = query?.Trim() ?? string.Empty;
+        }
+
+        /// <summary>Startup | Login | Connected — maps to AppSurfaceStates.</summary>
         public string AppSurface
         {
             get => _appSurface;
@@ -245,11 +279,17 @@ namespace Unison.Core.ViewModels
         /// </summary>
         public event EventHandler LoginExitTransitionRequested;
 
-        /// <summary>WideBoth | NarrowList | NarrowDetail â€” maps to ChatPaneStates.</summary>
+        /// <summary>WideBoth | NarrowList | NarrowDetail — maps to ChatPaneStates.</summary>
         public string ChatPane
         {
             get => _chatPane;
-            private set => Set(ref _chatPane, value);
+            private set
+            {
+                if (Set(ref _chatPane, value))
+                {
+                    OnPropertyChanged(nameof(HidesLegacyShellChrome));
+                }
+            }
         }
 
         public bool IsNarrowWindow
@@ -260,9 +300,20 @@ namespace Unison.Core.ViewModels
                 if (Set(ref _isNarrowWindow, value))
                 {
                     SyncChatPane();
+                    OnPropertyChanged(nameof(HidesLegacyShellChrome));
                 }
             }
         }
+
+        /// <summary>
+        /// WhatsApp Legacy Minimal / narrow: detail fullscreen (chat or status) —
+        /// shell brand + pivot headers should hide until the user leaves the detail.
+        /// Status detail still renders inside the pivot <c>StatusView</c>; the shell keeps
+        /// the pivot body visible and only collapses headers (see ShellView.ApplyShellChrome).
+        /// </summary>
+        public bool HidesLegacyShellChrome =>
+            IsNarrowWindow &&
+            string.Equals(ChatPane, PaneNarrowDetail, StringComparison.Ordinal);
 
         public bool HasActiveChat
         {
@@ -289,6 +340,66 @@ namespace Unison.Core.ViewModels
             string.Equals(ActiveSection, "settings", StringComparison.OrdinalIgnoreCase) ||
             (IsNarrowWindow && string.Equals(ChatPane, PaneNarrowDetail, StringComparison.Ordinal)) ||
             (!IsNarrowWindow && HasActiveChat);
+
+        /// <summary>
+        /// Status viewer open/close — same ChatPane NarrowDetail/NarrowList flip as <see cref="SelectChat"/>.
+        /// </summary>
+        public void SelectStatusDetail(bool open)
+        {
+            bool wasOpen = _statusDetailOpen;
+            _statusDetailOpen = open;
+            if (IsNarrowWindow)
+            {
+                ChatPane = open ? PaneNarrowDetail : PaneNarrowList;
+            }
+
+            if (wasOpen != open)
+            {
+                OnPropertyChanged(nameof(HasOpenStatusDetail));
+                OnPropertyChanged(nameof(HidesLegacyShellChrome));
+            }
+
+            RaiseSystemBackButtonChanged();
+        }
+
+        /// <summary>Entering Status shell page: default to list (or WideBoth).</summary>
+        public void EnterStatusSurface()
+        {
+            if (_statusDetailOpen)
+            {
+                _statusDetailOpen = false;
+                OnPropertyChanged(nameof(HasOpenStatusDetail));
+                OnPropertyChanged(nameof(HidesLegacyShellChrome));
+            }
+
+            SyncStatusPane();
+        }
+
+        /// <summary>Leaving Status: restore chat list/detail pane rules.</summary>
+        public void LeaveStatusSurface()
+        {
+            if (_statusDetailOpen)
+            {
+                _statusDetailOpen = false;
+                OnPropertyChanged(nameof(HasOpenStatusDetail));
+                OnPropertyChanged(nameof(HidesLegacyShellChrome));
+            }
+
+            // ActiveSection may still be Status during NavigatedFrom — do not call SyncChatPane.
+            if (IsNarrowWindow)
+            {
+                bool showDetail = HasActiveChat && PendingChat != null;
+                ChatPane = showDetail ? PaneNarrowDetail : PaneNarrowList;
+            }
+            else
+            {
+                ChatPane = PaneWideBoth;
+            }
+
+            RaiseSystemBackButtonChanged();
+        }
+
+        public bool HasOpenStatusDetail => _statusDetailOpen;
 
         /// <summary>
         /// Chat the page should open in ChatDetail (set by SelectChat / cleared by ClearChat).
@@ -352,6 +463,9 @@ namespace Unison.Core.ViewModels
         /// <summary>Navigates the shell content frame. Parameter: a <see cref="Constants.NavigationRoutes"/> value.</summary>
         public ICommand NavigateToSectionCommand { get; }
 
+        /// <summary>Opens settings directly on the profile (expanded on Unison, profile section on WhatsApp).</summary>
+        public ICommand OpenProfileSettingsCommand { get; }
+
         /// <summary>
         /// Imgur-style: wire service events once. Safe to call repeatedly.
         /// </summary>
@@ -409,12 +523,12 @@ namespace Unison.Core.ViewModels
                     return;
                 }
 
-                await _whatsAppService.InitializeConnectionStateAsync();
+                await _connectionService.InitializeConnectionStateAsync();
 
                 // Cold start: profile from auth / memory (no network).
                 ApplyProfile(_profileService.GetCurrentProfile());
 
-                if (await _whatsAppService.IsRegisteredAsync())
+                if (await _connectionService.IsRegisteredAsync())
                 {
                     EnterConnectedSurface();
                     _diagnostics.Write("startup", "fast-connect-dispatched");
@@ -447,7 +561,7 @@ namespace Unison.Core.ViewModels
         {
             try
             {
-                if (await _whatsAppService.IsRegisteredAsync())
+                if (await _connectionService.IsRegisteredAsync())
                 {
                     EnterConnectedSurface();
                     return;
@@ -570,7 +684,7 @@ namespace Unison.Core.ViewModels
             {
                 try
                 {
-                    _navigator.NavigateAndClear(NavigationRoutes.Login);
+                    _navigator.NavigateAndClear(NavigationDestination.Login);
                 }
                 catch (Exception ex)
                 {
@@ -581,7 +695,7 @@ namespace Unison.Core.ViewModels
 
             try
             {
-                _navigator.NavigateAndClear(NavigationRoutes.Start);
+                _navigator.NavigateAndClear(NavigationDestination.Start);
             }
             catch (Exception ex)
             {
@@ -601,7 +715,7 @@ namespace Unison.Core.ViewModels
         {
             try
             {
-                _navigator.NavigateAndClear(NavigationRoutes.Boot, "postPairing");
+                _navigator.NavigateAndClear(NavigationDestination.Boot, "postPairing");
                 PairingTrace("NavigateAndClear(Boot postPairing) OK");
             }
             catch (Exception ex)
@@ -622,7 +736,7 @@ namespace Unison.Core.ViewModels
 
             try
             {
-                _navigator.NavigateAndClear(NavigationRoutes.AppShell);
+                _navigator.NavigateAndClear(NavigationDestination.AppShell);
                 PairingTrace("NavigateAndClear(AppShell) OK");
             }
             catch (Exception ex)
@@ -649,7 +763,7 @@ namespace Unison.Core.ViewModels
 
             try
             {
-                _navigator.NavigateAndClear(NavigationRoutes.Start);
+                _navigator.NavigateAndClear(NavigationDestination.Start);
             }
             catch (Exception ex)
             {
@@ -694,7 +808,7 @@ namespace Unison.Core.ViewModels
             // is the flash before QR; NavigateAndClear tears the shell down anyway.
             try
             {
-                _navigator.NavigateAndClear(NavigationRoutes.Login);
+                _navigator.NavigateAndClear(NavigationDestination.Login);
                 PairingTrace("EnterLoginSurface NavigateAndClear(Login) startPairing=" + startPairing);
             }
             catch (Exception ex)
@@ -743,6 +857,23 @@ namespace Unison.Core.ViewModels
             }
         }
 
+        private void OpenProfileSettings()
+        {
+            if (IsPhoneHandset() && _isPaneOpen)
+            {
+                IsPaneOpen = false;
+            }
+
+            try
+            {
+                _navigator.OpenSettings(true);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("[ShellViewModel] OpenProfileSettings failed: " + ex.Message);
+            }
+        }
+
         private void NavigateToSection(string section)
         {
             if (string.IsNullOrWhiteSpace(section))
@@ -763,19 +894,31 @@ namespace Unison.Core.ViewModels
                 // re-wire when the route string was already applied.)
                 if (string.Equals(section, NavigationRoutes.Settings, StringComparison.OrdinalIgnoreCase))
                 {
-                    _navigator.NavigateInShell(NavigationRoutes.Settings);
+                    _navigator.OpenSettings();
                 }
                 else if (string.Equals(section, NavigationRoutes.Debug, StringComparison.OrdinalIgnoreCase))
                 {
-                    _navigator.NavigateInShell(NavigationRoutes.Debug);
+                    _navigator.NavigateInShell(NavigationDestination.Debug);
                 }
                 else if (string.Equals(section, NavigationRoutes.Status, StringComparison.OrdinalIgnoreCase))
                 {
-                    _navigator.NavigateInShellAndClear(NavigationRoutes.Status);
+                    _navigator.NavigateInShellAndClear(NavigationDestination.Status);
+                }
+                else if (string.Equals(section, NavigationRoutes.Calls, StringComparison.OrdinalIgnoreCase))
+                {
+                    _navigator.NavigateInShellAndClear(NavigationDestination.Calls);
+                }
+                else if (string.Equals(section, NavigationRoutes.Favorites, StringComparison.OrdinalIgnoreCase))
+                {
+                    _navigator.NavigateInShellAndClear(NavigationDestination.Favorites);
+                }
+                else if (string.Equals(section, NavigationRoutes.Archived, StringComparison.OrdinalIgnoreCase))
+                {
+                    _navigator.NavigateInShellAndClear(NavigationDestination.Archived);
                 }
                 else
                 {
-                    _navigator.NavigateInShellAndClear(NavigationRoutes.Chats);
+                    _navigator.NavigateInShellAndClear(NavigationDestination.Chats);
                 }
             }
             catch (Exception ex)
@@ -912,6 +1055,12 @@ namespace Unison.Core.ViewModels
 
         public void SyncChatPane()
         {
+            if (string.Equals(ActiveSection, NavigationRoutes.Status, StringComparison.OrdinalIgnoreCase))
+            {
+                SyncStatusPane();
+                return;
+            }
+
             if (IsNarrowWindow)
             {
                 // Minimal: chat space only with an open intent (PendingChat) and active flag.
@@ -919,6 +1068,20 @@ namespace Unison.Core.ViewModels
                 // cleared PendingChat while SelectChat was switching to NarrowDetail.
                 bool showDetail = HasActiveChat && PendingChat != null;
                 ChatPane = showDetail ? PaneNarrowDetail : PaneNarrowList;
+            }
+            else
+            {
+                ChatPane = PaneWideBoth;
+            }
+
+            RaiseSystemBackButtonChanged();
+        }
+
+        private void SyncStatusPane()
+        {
+            if (IsNarrowWindow)
+            {
+                ChatPane = _statusDetailOpen ? PaneNarrowDetail : PaneNarrowList;
             }
             else
             {
@@ -1035,7 +1198,7 @@ namespace Unison.Core.ViewModels
                 PairingTrace("SessionEstablished → EnterConnectedSurface");
                 Debug.WriteLine("[ShellViewModel] SessionEstablished → AppShell");
                 EnterConnectedSurface();
-                _whatsAppService.StartDeferredStartupMaintenance();
+                _connectionService.StartDeferredStartupMaintenance();
             });
         }
 
@@ -1078,7 +1241,7 @@ namespace Unison.Core.ViewModels
             bool registered;
             try
             {
-                registered = await _whatsAppService.IsRegisteredAsync().ConfigureAwait(false);
+                registered = await _connectionService.IsRegisteredAsync().ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -1113,7 +1276,7 @@ namespace Unison.Core.ViewModels
                 EnterConnectedSurface();
                 try
                 {
-                    _whatsAppService.StartDeferredStartupMaintenance();
+                    _connectionService.StartDeferredStartupMaintenance();
                 }
                 catch (Exception ex)
                 {
@@ -1131,7 +1294,7 @@ namespace Unison.Core.ViewModels
         {
             try
             {
-                await _whatsAppService.EnsureConnectedAsync();
+                await _connectionService.EnsureConnectedAsync();
             }
             catch (Exception ex)
             {
@@ -1157,8 +1320,12 @@ namespace Unison.Core.ViewModels
             try
             {
                 await Task.Delay(120);
-                await _whatsAppService.LoadPersistedUiStateAsync();
-                _notificationService.UpdateBadge(_whatsAppService.GetTotalUnreadCount());
+                await _connectionService.LoadPersistedUiStateAsync();
+                StartChatListAddressBookPass();
+                if (_chatService != null)
+                {
+                    _notificationService.UpdateBadge(_chatService.GetTotalUnreadCount());
+                }
                 if (_shortcutService != null)
                 {
                     await _shortcutService.RefreshPinnedUnreadAsync(_chatState.Chats);
@@ -1179,6 +1346,31 @@ namespace Unison.Core.ViewModels
                     ex);
                 Debug.WriteLine($"[ShellViewModel] Persisted UI load failed: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Address-book names for the restored 1:1 chats, without waiting for the session.
+        /// Off the UI thread: reading the agenda is slow on phones.
+        /// </summary>
+        private void StartChatListAddressBookPass()
+        {
+            if (_contactService == null)
+            {
+                return;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await _contactService.RefreshChatListAddressBookNamesAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _diagnostics?.RecordException("startup", "chat-list-address-book-failed", ex);
+                    Debug.WriteLine($"[ShellViewModel] Chat-list address-book pass failed: {ex.Message}");
+                }
+            });
         }
 
         private double ReadStoredChatListPaneWidth()

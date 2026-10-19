@@ -17,6 +17,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Google.Protobuf;
@@ -132,6 +133,12 @@ namespace Unison.Socket.Session
             get { return !_closed && _transport.IsConnected && _noise.IsFinished; }
         }
 
+        /// <summary>True while the background broker holds the socket. Sends fail until it is reclaimed.</summary>
+        public bool IsOwnedByBroker
+        {
+            get { return _transport.IsOwnedByBroker; }
+        }
+
         /// <summary>Server clock skew, applied by callers that stamp outgoing content.</summary>
         public long ServerTimeOffsetMs
         {
@@ -179,35 +186,57 @@ namespace Unison.Socket.Session
             _transport.MessageReceived += OnTransportMessageAsync;
             _transport.Closed += OnTransportClosed;
 
-            await _events.EmitAsync(
-                WaEventKind.ConnectionUpdate,
-                new ConnectionUpdate { Connection = ConnectionStatus.Connecting }).ConfigureAwait(false);
-
-            var uri = BuildConnectionUri();
-            var headers = BuildHeaders();
-
-            await _transport.ConnectAsync(uri, headers).ConfigureAwait(false);
-            await SendClientHelloAsync().ConfigureAwait(false);
-
-            using (var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            // From here on the transport may be open and we are subscribed to it, so every exit
+            // has to go through EndAsync. Letting a failed handshake propagate on its own left a
+            // live socket behind with these two handlers still attached: the host takes the
+            // exception as "connect failed" and builds a new session, while the abandoned one goes
+            // on receiving frames on a connection nobody will ever close. EndAsync is idempotent,
+            // so the transport closing underneath us on the way out is not a second close.
+            try
             {
-                timeoutCts.CancelAfter(_config.ConnectTimeout);
+                await _events.EmitAsync(
+                    WaEventKind.ConnectionUpdate,
+                    new ConnectionUpdate { Connection = ConnectionStatus.Connecting }).ConfigureAwait(false);
 
-                var completed = await Task.WhenAny(
-                    _handshakeCompletion.Task,
-                    Task.Delay(Timeout.Infinite, timeoutCts.Token)).ConfigureAwait(false);
+                var uri = BuildConnectionUri();
+                var headers = BuildHeaders();
 
-                if (completed != _handshakeCompletion.Task)
+                await _transport.ConnectAsync(uri, headers).ConfigureAwait(false);
+                await SendClientHelloAsync().ConfigureAwait(false);
+
+                using (var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    throw new WaConnectionException(
-                        $"Handshake timed out after {_config.ConnectTimeout.TotalSeconds:F0}s",
-                        DisconnectReason.ConnectionLost);
+                    timeoutCts.CancelAfter(_config.ConnectTimeout);
+
+                    var completed = await Task.WhenAny(
+                        _handshakeCompletion.Task,
+                        Task.Delay(Timeout.Infinite, timeoutCts.Token)).ConfigureAwait(false);
+
+                    if (completed != _handshakeCompletion.Task)
+                    {
+                        throw new WaConnectionException(
+                            $"Handshake timed out after {_config.ConnectTimeout.TotalSeconds:F0}s",
+                            DisconnectReason.ConnectionLost);
+                    }
+
+                    await _handshakeCompletion.Task.ConfigureAwait(false);
                 }
 
-                await _handshakeCompletion.Task.ConfigureAwait(false);
+                StartKeepAlive();
             }
+            catch (Exception ex)
+            {
+                try
+                {
+                    await EndAsync(ex).ConfigureAwait(false);
+                }
+                catch (Exception endError)
+                {
+                    _log.Error("Error closing connection after a failed connect", endError);
+                }
 
-            StartKeepAlive();
+                throw;
+            }
         }
 
         public async Task SendRawAsync(byte[] data)
@@ -217,12 +246,25 @@ namespace Unison.Socket.Session
                 throw new WaConnectionException("Connection closed", DisconnectReason.ConnectionClosed);
             }
 
-            var frame = _noise.EncodeFrame(data);
-
-            // Noise counters and framing are order-sensitive, so writes are serialised.
+            // Noise counters and framing are order-sensitive, so encoding and writing are
+            // serialised together. Encoding outside this gate was the same bug the comment
+            // warns about: each frame carries the nonce it was encrypted with, so two callers
+            // could encrypt as N and N+1 and then cross the gate in the other order. The
+            // server rejects the out-of-order frame and drops the socket. The keep-alive ping
+            // fires on a timer, so it collides with a user's message sooner or later.
             await _sendGate.WaitAsync().ConfigureAwait(false);
             try
             {
+                // Checked before encoding: a frame that is encrypted but never written still
+                // advances the write counter, and the server would reject the next real one.
+                if (_transport.IsOwnedByBroker)
+                {
+                    throw new WaConnectionException(
+                        "Socket is owned by the background broker",
+                        DisconnectReason.ConnectionClosed);
+                }
+
+                byte[] frame = _noise.EncodeFrame(data);
                 await _transport.SendAsync(frame).ConfigureAwait(false);
             }
             finally
@@ -240,6 +282,79 @@ namespace Unison.Socket.Session
 
             var encoder = new BinaryEncoder();
             return SendRawAsync(encoder.Encode(node));
+        }
+
+        /// <summary>
+        /// Lends the open socket to the background broker. <paramref name="saveCheckpoint"/>
+        /// receives the Noise state and the broker socket id after the transport has gone quiet
+        /// and before ownership moves; if it throws, the transfer is abandoned.
+        /// </summary>
+        /// <remarks>
+        /// The keep-alive stops first: the transport still reports itself connected while the
+        /// broker holds the socket, so a running keep-alive would see silence, end the session
+        /// and close the socket out from under the broker. The send gate is held throughout so
+        /// nothing can encrypt a frame between the checkpoint and the handoff.
+        /// </remarks>
+        public async Task<bool> TransferToBrokerAsync(
+            string reason,
+            Func<NoiseSessionState, string, Task> saveCheckpoint)
+        {
+            if (saveCheckpoint == null)
+            {
+                throw new ArgumentNullException(nameof(saveCheckpoint));
+            }
+
+            if (_transport.IsOwnedByBroker)
+            {
+                return true;
+            }
+
+            if (!IsConnected)
+            {
+                return false;
+            }
+
+            StopKeepAlive();
+            bool transferred = false;
+            await _sendGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                transferred = await _transport.TransferToBrokerAsync(
+                    reason,
+                    socketId => saveCheckpoint(_noise.ExportState(), socketId)).ConfigureAwait(false);
+                return transferred;
+            }
+            finally
+            {
+                _sendGate.Release();
+                if (!transferred && IsConnected)
+                {
+                    MarkFrameReceived();
+                    StartKeepAlive();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Takes the socket back from the broker. The transport replays the broker journal
+        /// through the receive path before this returns, so the session resumes with every
+        /// frame the broker read and the Noise state it ended on.
+        /// </summary>
+        public async Task<bool> ReclaimFromBrokerAsync()
+        {
+            if (!_transport.IsOwnedByBroker)
+            {
+                return false;
+            }
+
+            bool reclaimed = await _transport.ReclaimFromBrokerAsync().ConfigureAwait(false);
+            if (reclaimed)
+            {
+                MarkFrameReceived();
+                StartKeepAlive();
+            }
+
+            return reclaimed;
         }
 
         /// <summary>
@@ -490,8 +605,16 @@ namespace Unison.Socket.Session
                 _keepAlive = null;
             }
 
+            _transport.MessageReceived -= OnTransportMessageAsync;
+            _transport.Closed -= OnTransportClosed;
             Dispatcher.Clear();
-            _sendGate.Dispose();
+
+            // _sendGate is deliberately not disposed. The host gives a close three seconds and
+            // then abandons the session, which means Dispose runs precisely when a send is
+            // stuck holding this gate - the reason the close timed out. Disposing it under a
+            // waiter makes that send's Release throw ObjectDisposedException on the way out,
+            // replacing the real error with a lifecycle one. A SemaphoreSlim with no wait
+            // handle taken holds nothing that needs releasing.
         }
 
         private Uri BuildConnectionUri()
@@ -539,7 +662,18 @@ namespace Unison.Socket.Session
 
         private async Task OnTransportMessageAsync(object sender, WaTransportMessageEventArgs args)
         {
-            if (args == null || args.Data == null)
+            if (args == null)
+            {
+                return;
+            }
+
+            if (args.DecodedFrames != null)
+            {
+                await ApplyBrokerBatchAsync(args.DecodedFrames, args.PostNoiseState).ConfigureAwait(false);
+                return;
+            }
+
+            if (args.Data == null)
             {
                 return;
             }
@@ -551,7 +685,37 @@ namespace Unison.Socket.Session
             catch (Exception ex)
             {
                 _log.Error("Failed to decode inbound frame", ex);
+
+                // A replayed frame that fails has to fail the drain, so the broker journal
+                // keeps it for the next attempt instead of dropping it as delivered.
+                if (args.IsBrokerReplay)
+                {
+                    throw;
+                }
             }
+        }
+
+        /// <summary>
+        /// The broker's journal batch and its post-state were written as one checkpoint, so the
+        /// state is imported only after every frame of the batch was dispatched.
+        /// </summary>
+        private async Task ApplyBrokerBatchAsync(IList<byte[]> frames, NoiseSessionState postState)
+        {
+            if (postState == null)
+            {
+                throw new InvalidDataException("Broker batch without a Noise checkpoint");
+            }
+
+            foreach (byte[] frame in frames)
+            {
+                if (frame != null)
+                {
+                    await OnFrameAsync(frame).ConfigureAwait(false);
+                }
+            }
+
+            _noise.ImportState(postState);
+            _log.Info("Broker journal batch applied: frames=" + frames.Count + " readCounter=" + postState.ReadCounter);
         }
 
         private async Task OnFrameAsync(byte[] frame)
@@ -739,6 +903,16 @@ namespace Unison.Socket.Session
                 _log);
 
             _keepAlive.Start();
+        }
+
+        private void StopKeepAlive()
+        {
+            KeepAlive keepAlive = _keepAlive;
+            _keepAlive = null;
+            if (keepAlive != null)
+            {
+                keepAlive.Dispose();
+            }
         }
 
         private Task SendPingAsync()

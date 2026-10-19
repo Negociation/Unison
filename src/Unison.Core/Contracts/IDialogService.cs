@@ -1,4 +1,5 @@
 using System.Threading.Tasks;
+using Unison.Core.Models;
 using Unison.Core.ViewModels;
 
 namespace Unison.Core.Contracts
@@ -51,17 +52,53 @@ namespace Unison.Core.Contracts
         Task<string> ShowNewChatDialogAsync(NewChatDialogViewModel newChatVm);
 
         /// <summary>
-        /// Image send confirmation with preview. Returns true if the user taps Send.
+        /// Image send confirmation with preview and an optional caption box.
+        /// <see cref="ImageSendPreviewResult.Confirmed"/> is false when cancelled.
         /// </summary>
-        Task<bool> ShowImageSendPreviewAsync(byte[] imageBytes, string infoText);
+        Task<ImageSendPreviewResult> ShowImageSendPreviewAsync(
+            byte[] imageBytes,
+            string infoText,
+            string initialCaption = null);
 
-        /// <summary>Fullscreen pairing QR preview (tap on login QR). No-op if payload empty.</summary>
+        /// <summary>
+        /// Document send confirmation: file name row (chat-info Files layout) plus caption.
+        /// <see cref="ImageSendPreviewResult.Confirmed"/> is false when cancelled.
+        /// </summary>
+        Task<ImageSendPreviewResult> ShowDocumentSendPreviewAsync(
+            string fileName,
+            string infoText,
+            string initialCaption = null);
+
+        /// <summary>
+        /// Fullscreen pairing QR preview (tap on login QR). Subscribes to
+        /// <see cref="LoginViewModel.QrFullscreenDismissRequested"/> so the dialog closes when
+        /// pairing succeeds. No-op if payload empty.
+        /// </summary>
+        Task ShowQrFullscreenAsync(LoginViewModel loginVm);
+
+        /// <summary>Fullscreen QR preview from a raw payload (debug / socket slice). No dismiss listener.</summary>
         Task ShowQrFullscreenAsync(string qrData);
+
+        /// <summary>
+        /// WhatsApp-shell settings overlay (SplitView sections). Unison keeps the full-page SettingsView.
+        /// </summary>
+        Task ShowWhatsAppSettingsAsync(SettingsViewModel settingsVm, bool openProfile = false);
 
         /// <summary>
         /// Read-only list of who reacted to <paramref name="messageVm"/>. No-op when the bubble has
         /// no reactions.
         /// </summary>
         Task ShowReactionsDialogAsync(ChatMessageViewModel messageVm);
+
+        /// <summary>
+        /// Mobile-friendly runtime health dialog (snapshot + recent journal + save to disk).
+        /// </summary>
+        Task ShowRuntimeDiagnosticsAsync();
+
+        /// <summary>
+        /// Picks the Start tile glyph. Returns null when the user cancels.
+        /// The caller pins the tile only after a choice.
+        /// </summary>
+        Task<StartTileSelection> ShowStartTileMarkAsync(StartTileMark current, bool transparent);
     }
 }

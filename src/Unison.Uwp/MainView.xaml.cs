@@ -5,6 +5,7 @@ using Windows.Graphics.Display;
 using Windows.UI.Core;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Media.Imaging;
 using Windows.UI.Xaml.Navigation;
 using Microsoft.Extensions.DependencyInjection;
 using Unison.Core.Constants;
@@ -25,8 +26,6 @@ namespace Unison.Uwp
     {
         /// <summary>Matches SettingsView ExtendedWide AdaptiveTrigger.</summary>
         private const double ExtendedWideMinWidth = 1000;
-
-        public IWhatsAppService Service => App.GetWhatsAppService();
 
         private bool _uiEventsAttached;
         private bool _vmHooked;
@@ -125,13 +124,10 @@ namespace Unison.Uwp
         /// </summary>
         private void Navigator_ShellNavigated(object sender, string route)
         {
-            var chats = ShellContentFrame?.Content as ChatsView;
-            var status = ShellContentFrame?.Content as StatusView;
             Debug.WriteLine(
                 "[MainView] ShellNavigated route=" + (route ?? "?") +
                 " content=" + (ShellContentFrame?.Content?.GetType().Name ?? "null"));
-            WireChatsViewMenu(chats);
-            WireStatusViewMenu(status);
+            WireShellContentMenus(ShellContentFrame?.Content);
         }
 
         private void ShellViewModel_SessionUiResetRequested(object sender, EventArgs e)
@@ -144,10 +140,10 @@ namespace Unison.Uwp
             {
             }
 
-            var chats = ShellContentFrame?.Content as ChatsView;
-            if (chats != null)
+            var conversation = ShellContentFrame?.Content as IConversationShellPage;
+            if (conversation != null)
             {
-                _ = chats.ResetForLoggedOutAsync();
+                _ = conversation.ResetForLoggedOutAsync();
             }
 
             try
@@ -184,7 +180,6 @@ namespace Unison.Uwp
 
         private void MainView_Loaded(object sender, RoutedEventArgs e)
         {
-            (Service as WhatsAppService)?.AttachUiDispatcher(Dispatcher);
             AttachUiEvents();
 
             if (_shellViewModel == null && App.Services != null)
@@ -204,6 +199,7 @@ namespace Unison.Uwp
             EnsureShellContent();
 
             _shellViewModel.ReportWindowNarrow(IsNarrowWindow());
+            ApplyShellBrand();
             EnsureOrientationHook();
             ApplySystemBackButton();
             ViewModel.RefreshUserInfo();
@@ -214,36 +210,44 @@ namespace Unison.Uwp
         {
             if (ShellContentFrame.Content != null)
             {
-                WireChatsViewMenu(ShellContentFrame.Content as ChatsView);
-                WireStatusViewMenu(ShellContentFrame.Content as StatusView);
+                WireShellContentMenus(ShellContentFrame.Content);
                 return;
             }
 
             string section = ViewModel?.ActiveSection ?? NavigationRoutes.Chats;
             ViewModel?.NavigateToSectionCommand.Execute(section);
-            WireChatsViewMenu(ShellContentFrame.Content as ChatsView);
-            WireStatusViewMenu(ShellContentFrame.Content as StatusView);
+            WireShellContentMenus(ShellContentFrame.Content);
         }
 
-        private ChatsView _wiredChatsMenu;
+        private IConversationShellPage _wiredConversationMenu;
         private StatusView _wiredStatusMenu;
+        private CallsView _wiredCallsMenu;
+        private FavoritesView _wiredFavoritesMenu;
 
-        private void WireChatsViewMenu(ChatsView chats)
+        private void WireShellContentMenus(object content)
         {
-            if (_wiredChatsMenu != null)
+            WireConversationShellMenu(content as IConversationShellPage);
+            WireStatusViewMenu(content as StatusView);
+            WireCallsViewMenu(content as CallsView);
+            WireFavoritesViewMenu(content as FavoritesView);
+        }
+
+        private void WireConversationShellMenu(IConversationShellPage page)
+        {
+            if (_wiredConversationMenu != null)
             {
-                _wiredChatsMenu.MenuClicked -= ChatsView_MenuClicked;
-                _wiredChatsMenu = null;
+                _wiredConversationMenu.MenuClicked -= ChatsView_MenuClicked;
+                _wiredConversationMenu = null;
             }
 
-            if (chats == null)
+            if (page == null)
             {
                 return;
             }
 
-            chats.MenuClicked += ChatsView_MenuClicked;
-            _wiredChatsMenu = chats;
-            Debug.WriteLine("[MainView] WireChatsViewMenu attached");
+            page.MenuClicked += ChatsView_MenuClicked;
+            _wiredConversationMenu = page;
+            Debug.WriteLine("[MainView] WireConversationShellMenu attached");
         }
 
         private void WireStatusViewMenu(StatusView status)
@@ -262,6 +266,42 @@ namespace Unison.Uwp
             status.MenuClicked += ChatsView_MenuClicked;
             _wiredStatusMenu = status;
             Debug.WriteLine("[MainView] WireStatusViewMenu attached");
+        }
+
+        private void WireCallsViewMenu(CallsView calls)
+        {
+            if (_wiredCallsMenu != null)
+            {
+                _wiredCallsMenu.MenuClicked -= ChatsView_MenuClicked;
+                _wiredCallsMenu = null;
+            }
+
+            if (calls == null)
+            {
+                return;
+            }
+
+            calls.MenuClicked += ChatsView_MenuClicked;
+            _wiredCallsMenu = calls;
+            Debug.WriteLine("[MainView] WireCallsViewMenu attached");
+        }
+
+        private void WireFavoritesViewMenu(FavoritesView favorites)
+        {
+            if (_wiredFavoritesMenu != null)
+            {
+                _wiredFavoritesMenu.MenuClicked -= ChatsView_MenuClicked;
+                _wiredFavoritesMenu = null;
+            }
+
+            if (favorites == null)
+            {
+                return;
+            }
+
+            favorites.MenuClicked += ChatsView_MenuClicked;
+            _wiredFavoritesMenu = favorites;
+            Debug.WriteLine("[MainView] WireFavoritesViewMenu attached");
         }
 
         private void ShellViewModel_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -290,8 +330,7 @@ namespace Unison.Uwp
                 // Handset must stay Overlay — VSM Extended may flip DisplayMode to Inline
                 // after Settings, and SyncInlineSidebar would immediately close an open pane.
                 EnsurePhoneHandsetOverlayMode();
-                WireChatsViewMenu(ShellContentFrame.Content as ChatsView);
-                WireStatusViewMenu(ShellContentFrame.Content as StatusView);
+                WireShellContentMenus(ShellContentFrame.Content);
                 if (!IsPhoneHandset())
                 {
                     SyncInlineSidebarForWindowWidth();
@@ -322,9 +361,9 @@ namespace Unison.Uwp
             {
                 ViewModel.NavigateToSectionCommand.Execute(NavigationRoutes.Chats);
                 EnsureShellContent();
-                var chats = ShellContentFrame?.Content as ChatsView;
-                WireChatsViewMenu(chats);
-                chats?.RequestOpenPendingDeepLink();
+                var conversation = ShellContentFrame?.Content as IConversationShellPage;
+                WireConversationShellMenu(conversation);
+                conversation?.RequestOpenPendingDeepLink();
             }
             catch (Exception ex)
             {
@@ -335,16 +374,41 @@ namespace Unison.Uwp
         private void ApplySystemBackButton()
         {
             bool show = ViewModel?.ShowSystemBackButton == true;
-            var chats = ShellContentFrame.Content as ChatsView;
-            if (!show && chats != null && ViewModel != null &&
-                ((ViewModel.IsNarrowWindow && ViewModel.ChatPane == ShellViewModel.PaneNarrowDetail) ||
-                 (!ViewModel.IsNarrowWindow && ViewModel.HasActiveChat)))
+            if (!show && ViewModel != null && ShouldShowChatShellBackButton(ShellContentFrame.Content))
             {
                 show = true;
             }
 
             SystemNavigationManager.GetForCurrentView().AppViewBackButtonVisibility =
                 show ? AppViewBackButtonVisibility.Visible : AppViewBackButtonVisibility.Collapsed;
+        }
+
+        private bool ShouldShowChatShellBackButton(object content)
+        {
+            if (ViewModel == null)
+            {
+                return false;
+            }
+
+            bool hasActiveShellChat =
+                (ViewModel.IsNarrowWindow && ViewModel.ChatPane == ShellViewModel.PaneNarrowDetail) ||
+                (!ViewModel.IsNarrowWindow && ViewModel.HasActiveChat);
+
+            if (content is IConversationShellPage)
+            {
+                return hasActiveShellChat;
+            }
+
+            // Status uses the same ChatPane NarrowDetail flip as chats (SelectStatusDetail).
+            var status = content as StatusView;
+            if (status != null)
+            {
+                return ViewModel.IsNarrowWindow &&
+                       (status.HasOpenStatusDetail ||
+                        string.Equals(ViewModel.ChatPane, ShellViewModel.PaneNarrowDetail, StringComparison.Ordinal));
+            }
+
+            return false;
         }
 
         private void SyncNavSelection()
@@ -408,8 +472,8 @@ namespace Unison.Uwp
             }
 
             // Chat / Status detail chrome first.
-            var chats = ShellContentFrame.Content as ChatsView;
-            if (chats != null && chats.TryHandleBack())
+            var conversation = ShellContentFrame.Content as IConversationShellPage;
+            if (conversation != null && conversation.TryHandleBack())
             {
                 e.Handled = true;
                 return;
@@ -659,7 +723,8 @@ namespace Unison.Uwp
                 return true;
             }
 
-            return ShellContentFrame?.Content is SettingsView;
+            return App.Services?.GetService<Unison.Uwp.Services.Themes.IShellNavigationStrategy>()
+                       ?.IsSettingsPage(ShellContentFrame?.Content) == true;
         }
 
         private void SetPaneOpen(bool open)
@@ -672,6 +737,33 @@ namespace Unison.Uwp
             if (ViewModel != null && ViewModel.IsPaneOpen != open)
             {
                 ViewModel.IsPaneOpen = open;
+            }
+        }
+
+        private void ApplyShellBrand()
+        {
+            IShellThemeService theme = null;
+            try
+            {
+                theme = App.Services?.GetService<IShellThemeService>();
+            }
+            catch
+            {
+            }
+
+            if (theme == null)
+            {
+                return;
+            }
+
+            if (SidebarBrandText != null && !string.IsNullOrWhiteSpace(theme.ShellBrandName))
+            {
+                SidebarBrandText.Text = theme.ShellBrandName;
+            }
+
+            if (SidebarBrandIcon != null && !string.IsNullOrWhiteSpace(theme.ShellBrandIcon))
+            {
+                SidebarBrandIcon.Source = new BitmapImage(new Uri(theme.ShellBrandIcon));
             }
         }
 

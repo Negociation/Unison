@@ -17,6 +17,32 @@ namespace Unison.Core.Contracts.WhatsApp
         event System.EventHandler DisplayNamesUpdated;
 
         /// <summary>
+        /// Asks listeners to re-read labels after the list fold or another bulk rename that did
+        /// not go through the usual name-resolution path.
+        /// </summary>
+        void NotifyDisplayNamesUpdated();
+
+        /// <summary>
+        /// Best known label for a JID: device address book first, then the push name the account
+        /// broadcasts, then the bare number. <paramref name="context"/> only labels the call site
+        /// in diagnostics.
+        /// </summary>
+        string ResolveDisplayName(string jid, string context);
+
+        /// <summary>
+        /// JID → the name this device's address book has for that person. Empty until the overlay
+        /// has been read; a chat with no entry here falls back to the push name.
+        /// </summary>
+        IReadOnlyDictionary<string, string> PhoneContactNamesByJid { get; }
+
+        /// <summary>
+        /// The cached picture would not decode, so the file is dropped and the chat goes back to
+        /// its glyph until the next fetch. Called by the image host, which is the only place that
+        /// learns a cached avatar is unreadable.
+        /// </summary>
+        void MarkAvatarImageLoadFailed(ChatItem chat, string reason);
+
+        /// <summary>
         /// Reads the device address book and maps display names onto known JIDs.
         /// Updates <see cref="Person"/> name (never avatar) and promotes Source to AddressBook
         /// when the agenda name is distinct.
@@ -31,6 +57,12 @@ namespace Unison.Core.Contracts.WhatsApp
         /// Uses <see cref="IWhatsAppService"/> only for the raw fetch/apply primitives.
         /// </summary>
         Task RetrieveContactPicturesAsync(CancellationToken cancellationToken = default(CancellationToken));
+
+        /// <summary>
+        /// Puts picture files already on disk onto the chat rows. One UI pass to see which rows
+        /// need it, the disk probe off that thread, then one UI pass to write the URIs.
+        /// </summary>
+        Task HydrateCachedAvatarUrisAsync(string reason);
 
         /// <summary>
         /// One idle pass of group-member pictures (16, then schedules the next). Confirmed
@@ -62,6 +94,12 @@ namespace Unison.Core.Contracts.WhatsApp
         /// <summary>Refreshes the device-contact name overlay for the given direct chats.</summary>
         Task RefreshPhoneContactOverlayAsync(bool force);
 
+        /// <summary>
+        /// Names the 1:1 chats already in the list from the device address book, then relabels
+        /// the rows. Groups are skipped. Local only, so it can run before the session is up.
+        /// </summary>
+        Task RefreshChatListAddressBookNamesAsync();
+
         /// <summary>True while a <see cref="RefreshContactNamesAsync"/> call is in flight.</summary>
         bool IsContactRefreshRunning { get; }
 
@@ -78,9 +116,6 @@ namespace Unison.Core.Contracts.WhatsApp
         /// Single-chat avatar refresh with in-session dedup (used by UI on load-failure/visibility/JID-alias discovery).
         /// </summary>
         void RequestAvatarRefresh(ChatItem chat, bool force = false);
-
-        /// <summary>Clears the "already attempted this session" marker for a JID so it can be retried immediately.</summary>
-        void ClearAvatarAttempted(string jid);
 
         /// <summary>
         /// User action: resolve a phone number to a WhatsApp JID (new-chat search).

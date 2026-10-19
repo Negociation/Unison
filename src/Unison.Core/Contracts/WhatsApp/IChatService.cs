@@ -10,6 +10,8 @@
 // because the list has to sort and draw before any of that round trips - and
 // has to keep working with no connection at all.
 // =============================================================================
+using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using Unison.Core.Models;
 
@@ -30,5 +32,91 @@ namespace Unison.Core.Contracts.WhatsApp
         /// so it is safe to call every time a chat is opened.
         /// </summary>
         Task MarkReadAsync(ChatItem chat);
+
+        /// <summary>
+        /// Deletes the conversation for this account everywhere: it leaves the list here, on the
+        /// phone and on every other linked device. The messages are removed locally too - unlike a
+        /// pin there is nothing to revert to, so this is not undoable and callers are expected to
+        /// have asked first.
+        /// </summary>
+        Task DeleteChatAsync(ChatItem chat);
+
+        /// <summary>
+        /// Which conversation is on screen. The notification path reads it to stay quiet about the
+        /// chat the user is already looking at; null means none.
+        /// </summary>
+        void SetActiveChatJid(string jid);
+
+        /// <summary>User action: makes sure a chat row exists for <paramref name="jid"/> (new-chat flow).</summary>
+        void StartNewChat(string jid);
+
+        /// <summary>
+        /// Zeroes the unread count locally, on every row that is the same conversation. PN and LID
+        /// aliases can briefly produce more than one row, and a leftover alias is enough to put the
+        /// badge back on a chat the user just read. This is the local half only - the account is
+        /// told by <see cref="MarkReadAsync"/>.
+        /// </summary>
+        Task ClearUnreadForChatAsync(string jid);
+
+        /// <summary>Unread across every conversation, for the tile and the taskbar badge.</summary>
+        int GetTotalUnreadCount();
+
+        /// <summary>
+        /// Writes just these list rows to the preview store. For a caller that already changed the
+        /// strip on screen and only needs the mirror to agree; it does not rewrite names or aliases.
+        /// </summary>
+        void PersistChatListRows(IList<ChatItem> chats);
+
+        /// <summary>
+        /// Realigns the list strip with the newest row in SQLite where the list fell behind - a
+        /// send from another device, or a history chunk that stored messages without touching the
+        /// preview. Null checks every open row.
+        /// </summary>
+        Task ReconcileChatPreviewsFromSqliteAsync(
+            IReadOnlyList<string> chatJids = null,
+            string reason = null);
+
+        /// <summary>
+        /// Live inbound: create/find the list row, write the strip tip, bump unread when
+        /// <see cref="LiveIncomingChatListApplyRequest.CountsAsUnread"/>, reposition for display.
+        /// Must run list mutations on the UI thread. Returns the row and total unread for toast.
+        /// </summary>
+        Task<LiveIncomingChatListApplyResult> ApplyLiveIncomingChatListAsync(
+            LiveIncomingChatListApplyRequest request);
+
+        /// <summary>
+        /// Folds one replayed message into its chat's tip. Unread is decided here, once; the
+        /// first tip arms a short timer that flushes the tips onto the list.
+        /// </summary>
+        void RecordOfflineReplayTip(OfflineReplayTipRequest request);
+
+        /// <summary>
+        /// Applies every waiting offline replay tip to the list. A failure puts them back and rethrows.
+        /// </summary>
+        Task FlushOfflineReplayTipsAsync(string reason);
+
+        /// <summary>Updates list rows for one chat tip (duplicate/revoke/replay refresh).</summary>
+        Task RefreshChatPreviewAsync(
+            string chatJid,
+            string previewText,
+            DateTime timestamp,
+            bool isFromMe,
+            ChatPreviewKind? kindHint = null,
+            string authorPrefix = null,
+            string participantJid = null,
+            string senderName = null);
+
+        /// <summary>Re-tips every open row from the in-memory message cache.</summary>
+        Task RefreshAllChatPreviewsFromStoredAsync(string reason);
+
+        /// <summary>Creates missing rows and re-tips/reorders from the in-memory message cache.</summary>
+        Task ReconcileChatListFromStoredAsync(string reason);
+
+        /// <summary>
+        /// Collapses rows that are the same person and re-keys in-memory timelines to the
+        /// canonical address. Fire-and-forget from the list; the fold itself is awaited by
+        /// callers that need the list settled first.
+        /// </summary>
+        void RequestChatListDedup(string reason);
     }
 }

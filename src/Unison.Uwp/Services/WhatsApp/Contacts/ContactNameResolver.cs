@@ -16,10 +16,13 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Unison.Core.Contracts;
 using Unison.Core.Contracts.WhatsApp;
 using Unison.Core.Helpers;
 using Unison.Core.Models;
+using Unison.Core.State;
 using Unison.Uwp.Helpers;
+using Unison.Uwp.Services.Socket;
 
 namespace Unison.Uwp.Services.WhatsApp.Contacts
 {
@@ -34,8 +37,19 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
         private DateTime _lastForcedGroupPassUtc = DateTime.MinValue;
 
         private readonly IWhatsAppService _whatsAppService;
+        private readonly IWhatsAppSessionProvider _sessions;
+        private readonly IDispatcher _ui;
+        private readonly ChatNameRefresh _nameRefresh;
+        private readonly IChatCatalogPersistence _catalog;
+        private readonly IGroupService _groups;
         private readonly AddressBookOverlay _addressBook;
         private readonly ContactDirectory _directory;
+        private readonly ContactUsyncResolver _usync;
+        private readonly IJidResolver _jids;
+        private readonly PushNameLookup _pushNames;
+        private readonly IChatStateStore _chatState;
+        private readonly SyncStatusChannel _syncStatus;
+        private readonly SyncWorkGate _syncWork;
 
         private DateTime _lastRefreshUtc = DateTime.MinValue;
         private volatile bool _isRunning;
@@ -43,11 +57,33 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
         internal ContactNameResolver(
             IWhatsAppService whatsAppService,
             AddressBookOverlay addressBook,
-            ContactDirectory directory)
+            ContactDirectory directory,
+            ContactUsyncResolver usync,
+            IJidResolver jids,
+            PushNameLookup pushNames,
+            IGroupService groups,
+            IDispatcher ui,
+            IChatCatalogPersistence catalog,
+            IChatStateStore chatState,
+            SyncStatusChannel syncStatus,
+            SyncWorkGate syncWork,
+            IWhatsAppSessionProvider sessions,
+            ChatNameRefresh nameRefresh)
         {
+            _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
+            _nameRefresh = nameRefresh ?? throw new ArgumentNullException(nameof(nameRefresh));
+            _pushNames = pushNames ?? throw new ArgumentNullException(nameof(pushNames));
+            _syncStatus = syncStatus ?? throw new ArgumentNullException(nameof(syncStatus));
+            _syncWork = syncWork ?? throw new ArgumentNullException(nameof(syncWork));
+            _chatState = chatState ?? throw new ArgumentNullException(nameof(chatState));
+            _ui = ui ?? throw new ArgumentNullException(nameof(ui));
+            _catalog = catalog ?? throw new ArgumentNullException(nameof(catalog));
             _whatsAppService = whatsAppService ?? throw new ArgumentNullException(nameof(whatsAppService));
+            _groups = groups ?? throw new ArgumentNullException(nameof(groups));
             _addressBook = addressBook ?? throw new ArgumentNullException(nameof(addressBook));
             _directory = directory ?? throw new ArgumentNullException(nameof(directory));
+            _usync = usync ?? throw new ArgumentNullException(nameof(usync));
+            _jids = jids ?? throw new ArgumentNullException(nameof(jids));
         }
 
         public bool IsRunning => _isRunning;
@@ -60,7 +96,7 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
         /// </summary>
         public async Task RefreshAsync(bool includeGroups = false, bool force = false)
         {
-            if (_whatsAppService.IsReplayDrainActive)
+            if (_syncWork.IsReplayDrainActive)
             {
                 Debug.WriteLine("[ContactNameResolver] Refresh skipped (replay drain active)");
                 return;
@@ -72,7 +108,7 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
                 return;
             }
 
-            if (!_whatsAppService.IsTransportReady)
+            if (!_sessions.IsTransportReady)
             {
                 Debug.WriteLine("[ContactNameResolver] Refresh skipped (socket not ready)");
                 _refreshLock.Release();
@@ -89,18 +125,35 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
             try
             {
                 _isRunning = true;
-                _whatsAppService.RaiseSyncStatus(SyncPhaseStatus.Format(SyncPhaseStatus.Names));
+                _syncStatus.Raise(SyncPhaseStatus.Format(SyncPhaseStatus.Names));
 
                 if (includeGroups)
                 {
                     await _directory.HarvestGroupMappingsAsync().ConfigureAwait(false);
                 }
 
-                var directJids = _whatsAppService.Chats
-                    .Where(c => c != null && !c.IsGroup && !string.IsNullOrEmpty(c.JID))
-                    .Select(c => JidHelper.Normalize(c.JID))
-                    .Distinct()
-                    .ToList();
+                // Snapshot on the UI thread, the way ResolveMissing does it below. Walking the
+                // live collection from here reads it while the UI thread may be adding a chat,
+                // and an observable collection answers that with InvalidOperationException -
+                // on a background task, with nobody to catch it.
+                var directJids = new List<string>();
+                await _ui.RunAsync(() =>
+                {
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (ChatItem chat in _chatState.Chats)
+                    {
+                        if (chat == null || chat.IsGroup || string.IsNullOrEmpty(chat.JID))
+                        {
+                            continue;
+                        }
+
+                        string jid = JidHelper.Normalize(chat.JID);
+                        if (seen.Add(jid))
+                        {
+                            directJids.Add(jid);
+                        }
+                    }
+                });
 
                 if (!force && directJids.Count > 12)
                 {
@@ -115,12 +168,12 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
 
                 if (includeGroups)
                 {
-                    await _whatsAppService.QueryAllGroupsAsync(force);
+                    await _groups.QueryAllGroupsAsync(force);
                 }
 
                 await _addressBook.RefreshAsync(force);
-                await _whatsAppService.ApplyResolvedDisplayNamesToChatsAsync();
-                _whatsAppService.SchedulePersistPublic();
+                await _nameRefresh.ApplyAsync();
+                _catalog.Schedule();
                 _lastRefreshUtc = DateTime.UtcNow;
 
                 Debug.WriteLine($"[ContactNameResolver] Refresh complete: directChats={directJids.Count}, includeGroups={includeGroups}, force={force}");
@@ -132,7 +185,7 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
             finally
             {
                 _isRunning = false;
-                _whatsAppService.RaiseSyncStatus(null);
+                _syncStatus.Raise(null);
                 _refreshLock.Release();
             }
         }
@@ -143,11 +196,16 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
         /// </summary>
         public async Task ResolveMissingAsync()
         {
-            if (_whatsAppService.IsReplayDrainActive)
+            if (_syncWork.IsReplayDrainActive)
             {
                 Debug.WriteLine("[ContactNameResolver] ResolveMissing skipped (replay drain active)");
                 return;
             }
+
+            // Names already on file come first and need no network. Every exit below (refresh
+            // running, cooldown, nothing left to ask) used to skip them, so after a sync the list
+            // kept numbers the chat screen could already name.
+            await _nameRefresh.ApplyAsync();
 
             if (_isRunning)
             {
@@ -155,17 +213,16 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
                 return;
             }
 
-            if (!_whatsAppService.IsTransportReady)
+            if (!_sessions.IsTransportReady)
             {
                 Debug.WriteLine("[ContactNameResolver] ResolveMissing skipped network query (handshake not complete)");
-                await _whatsAppService.ApplyResolvedDisplayNamesToChatsAsync();
                 return;
             }
 
             var list = new List<ChatItem>();
-            await _whatsAppService.RunOnUiThreadAsync(() =>
+            await _ui.RunAsync(() =>
             {
-                foreach (var c in _whatsAppService.Chats) list.Add(c);
+                foreach (var c in _chatState.Chats) list.Add(c);
             });
 
             Debug.WriteLine($"[ContactNameResolver] ResolveMissing scanning {list.Count} chats...");
@@ -180,7 +237,7 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
             if (needsGroupQuery && DateTime.UtcNow - _lastForcedGroupPassUtc >= ForcedGroupPassWindow)
             {
                 _lastForcedGroupPassUtc = DateTime.UtcNow;
-                _whatsAppService.RaiseSyncStatus(SyncPhaseStatus.Format(SyncPhaseStatus.Groups));
+                _syncStatus.Raise(SyncPhaseStatus.Format(SyncPhaseStatus.Groups));
                 try
                 {
                     // The participating query already falls back to per-group metadata for the
@@ -191,7 +248,7 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
                     // Forced, because we only got here by finding a group that still shows its
                     // JID: the reuse window exists to suppress redundant passes, and after the
                     // first sync it was suppressing the only pass that would have named them.
-                    await _whatsAppService.QueryAllGroupsAsync(force: true);
+                    await _groups.QueryAllGroupsAsync(force: true);
                 }
                 catch (Exception exGroup)
                 {
@@ -225,8 +282,8 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
             try
             {
                 await _addressBook.RefreshAsync(force: false);
-                await _whatsAppService.ApplyResolvedDisplayNamesToChatsAsync();
-                _whatsAppService.SchedulePersistPublic();
+                await _nameRefresh.ApplyAsync();
+                _catalog.Schedule();
             }
             catch (Exception exPost)
             {
@@ -241,11 +298,10 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
 
             foreach (var chat in chats)
             {
-                string bareJid = chat.JID.Split('@')[0];
-                bool isNaked = string.IsNullOrEmpty(chat.Name) ||
-                               chat.Name == bareJid ||
-                               chat.Name.Contains("@") ||
-                               SelfChatDisplayHelper.IsSelfMarkerLabel(chat.Name);
+                bool isNaked = PlaceholderChatLabel.IsPlaceholder(
+                    chat.Name,
+                    chat.JID,
+                    SelfChatDisplayHelper.IsSelfMarkerLabel(chat.Name));
                 if (!isNaked)
                 {
                     continue;
@@ -268,7 +324,7 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
                 // The name may be published under the LID rather than the phone number, so a
                 // known alias is worth asking about too.
                 string normJid = JidHelper.Normalize(chat.JID);
-                if (_whatsAppService.JidAlias.TryGetValue(normJid, out var aliasJid))
+                if (_jids.TryGetAlias(normJid, out var aliasJid))
                 {
                     jidsToResolve.Add(aliasJid);
                     Debug.WriteLine($"[ContactNameResolver]   Adding LID for resolution: {chat.JID} -> {aliasJid}");
@@ -288,17 +344,17 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
 
                 // Each usync can sit for seconds; without a count this whole stretch looked to
                 // the user like the app had stopped doing anything.
-                _whatsAppService.RaiseSyncStatus(
+                _syncStatus.Raise(
                     SyncPhaseStatus.Format(SyncPhaseStatus.Names, i, jids.Count));
 
                 try
                 {
-                    await _whatsAppService.ResolveContactsAsync(chunk);
+                    await _usync.ResolveAsync(chunk);
                 }
                 catch (Exception ex)
                 {
                     Debug.WriteLine(
-                        $"[ContactNameResolver] ResolveContactsAsync chunk failed ({chunk.Length} JIDs): {ex.Message}");
+                        $"[ContactNameResolver] Usync chunk failed ({chunk.Length} JIDs): {ex.Message}");
                 }
             }
         }
@@ -311,7 +367,7 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
         {
             var unresolved = directJids
                 .Where(j => !IsSelfJid(j))
-                .Where(j => !_whatsAppService.HasResolvedContactName(j))
+                .Where(j => !_pushNames.HasName(j, _jids.GetCanonicalJid(j)))
                 .ToList();
 
             if (unresolved.Count == 0)
@@ -330,9 +386,9 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
             {
                 try
                 {
-                    _whatsAppService.RaiseSyncStatus(
+                    _syncStatus.Raise(
                         SyncPhaseStatus.Format(SyncPhaseStatus.Names, retried++, unresolved.Count));
-                    await _whatsAppService.ResolveContactsAsync(new[] { jid });
+                    await _usync.ResolveAsync(new[] { jid });
                 }
                 catch (Exception ex)
                 {
@@ -345,7 +401,7 @@ namespace Unison.Uwp.Services.WhatsApp.Contacts
 
         private bool IsSelfJid(string jid)
         {
-            var profile = _whatsAppService.CurrentProfile;
+            var profile = _jids.Self;
             if (string.IsNullOrEmpty(jid) || profile == null)
             {
                 return false;

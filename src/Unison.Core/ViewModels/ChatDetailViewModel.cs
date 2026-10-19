@@ -27,12 +27,15 @@ namespace Unison.Core.ViewModels
     {
         // ── DI ────────────────────────────────────────────────────────────────
 
-        /// <summary>Load / live updates / presence for the active JID.</summary>
-        private readonly IWhatsAppService _whatsAppService;
+        /// <summary>Whether presence may be subscribed yet.</summary>
+        private readonly IConnectionService _connectionService;
+
+        /// <summary>Who may write in this group, and who is in it.</summary>
+        private readonly IGroupService _groupService;
 
         /// <summary>
-        /// The chat list. Message reads still go through the service, because finding a chat's
-        /// messages needs the canonical-JID mapping that the store knows nothing about.
+        /// The chat list. Message reads still go through the message facade, because finding a
+        /// chat's messages needs the canonical-JID mapping the store knows nothing about.
         /// </summary>
         private readonly IChatStateStore _chatState;
 
@@ -50,12 +53,16 @@ namespace Unison.Core.ViewModels
 
         /// <summary>Unitary microphone capture (returns session handles).</summary>
         private readonly IAudioRecordingService _audioRecording;
+        private readonly IUiSoundService _uiSounds;
 
         /// <summary>File pickers — chat attach uses PickChatAttachmentAsync.</summary>
         private readonly IFilePicker _filePicker;
 
-        /// <summary>Confirm/preview/error dialogs (no ContentDialog in Core).</summary>
+        /// <summary>Confirm dialogs (delete chat, call phone, …).</summary>
         private readonly IDialogService _dialogs;
+
+        /// <summary>Opens system URIs (tel:, http, …).</summary>
+        private readonly IUriLauncher _uriLauncher;
 
         /// <summary>UI-thread marshaling for live updates / elapsed ticks.</summary>
         private readonly IDispatcher _dispatcher;
@@ -75,7 +82,7 @@ namespace Unison.Core.ViewModels
         /// <summary>Device People card for contacts not yet in the address book.</summary>
         private readonly IContactService _contactService;
 
-        /// <summary>Mobile vs desktop UI window sizes.</summary>
+        /// <summary>Device info (kept for other Mobile/desktop branching in this VM).</summary>
         private readonly ISystemInfoProvider _systemInfo;
 
         /// <summary>Debug session log (visible on Debug screen).</summary>
@@ -83,6 +90,9 @@ namespace Unison.Core.ViewModels
 
         /// <summary>Runtime diagnostics journal (Debug screen).</summary>
         private readonly IRuntimeDiagnostics _diagnostics;
+
+        /// <summary>Keeps the chat-list author strip in step with the names resolved here.</summary>
+        private readonly IChatAuthorProjection _authorProjection;
 
         // ── State ─────────────────────────────────────────────────────────────
 
@@ -115,6 +125,12 @@ namespace Unison.Core.ViewModels
         /// </summary>
         private readonly GroupParticipantLookup _participants;
 
+        /// <summary>What participant resolution is allowed to reach. Shared with the lookup above.</summary>
+        private readonly ParticipantResolutionContext _participantContext;
+
+        /// <summary>Which JIDs are the same person (PN vs LID).</summary>
+        private readonly IJidResolver _jids;
+
         /// <summary>How many bubble VMs to materialize when opening a chat (service may hold more data).</summary>
         public int InitialUiMessageWindow { get; }
 
@@ -122,7 +138,6 @@ namespace Unison.Core.ViewModels
         public int MaxUiMessageWindow { get; }
 
         public ChatDetailViewModel(
-            IWhatsAppService whatsAppService,
             IChatStateStore chatState,
             IMessageService messageService,
             IShortcutService shortcutService,
@@ -134,35 +149,51 @@ namespace Unison.Core.ViewModels
             IChatMessageVmFactory messageFactory,
             IChatDetailInfoViewModelFactory infoFactory,
             IStringResources strings,
+            IJidResolver jids,
             IPersonStore personStore = null,
             ISessionLogger sessionLogger = null,
             IRuntimeDiagnostics diagnostics = null,
             IChatService chatService = null,
             IContactService contactService = null,
-            ISystemInfoProvider systemInfo = null)
+            ISystemInfoProvider systemInfo = null,
+            IUriLauncher uriLauncher = null,
+            IConnectionService connectionService = null,
+            IGroupService groupService = null,
+            IChatAuthorProjection authorProjection = null,
+            IUiSoundService uiSounds = null)
         {
             _chatService = chatService;
-            _whatsAppService = whatsAppService;
+            _connectionService = connectionService;
+            _groupService = groupService;
             _chatState = chatState ?? throw new ArgumentNullException(nameof(chatState));
             _messageService = messageService ?? throw new ArgumentNullException(nameof(messageService));
             _shortcutService = shortcutService;
             _chatStore = chatStore;
             _audioRecording = audioRecording;
+            _uiSounds = uiSounds;
             _filePicker = filePicker;
             _dialogs = dialogs;
+            _uriLauncher = uriLauncher;
             _dispatcher = dispatcher;
             _messageFactory = messageFactory ?? throw new ArgumentNullException(nameof(messageFactory));
             _infoFactory = infoFactory ?? throw new ArgumentNullException(nameof(infoFactory));
             _strings = strings;
+            _jids = jids ?? throw new ArgumentNullException(nameof(jids));
             _personStore = personStore;
             _contactService = contactService;
             _systemInfo = systemInfo;
             _sessionLogger = sessionLogger;
             _diagnostics = diagnostics;
+            _authorProjection = authorProjection;
 
-            bool mobile = _systemInfo != null && _systemInfo.IsMobile();
-            InitialUiMessageWindow = mobile ? 30 : 50;
-            MaxUiMessageWindow = mobile ? 80 : 150;
+            _participantContext = new ParticipantResolutionContext(jids, contactService, chatState, personStore);
+
+            // Open-chat bubble budget follows memory tier (not DeviceFamily): Unsupported/Low keep
+            // the old Mobile 30/80 window; High keeps the desktop 50/150.
+            SyncWorkloadStrategy uiWindow = SyncWorkloadStrategy.For(
+                _systemInfo != null ? _systemInfo.GetDeviceCategory() : DeviceCategory.High);
+            InitialUiMessageWindow = uiWindow.InitialUiMessageWindow;
+            MaxUiMessageWindow = uiWindow.MaxUiMessageWindow;
 
             Messages = new ObservableCollection<ChatMessageViewModel>();
 
@@ -178,13 +209,14 @@ namespace Unison.Core.ViewModels
                 () => _ = RunSafeAsync(AttachAudioAsync, "attach-audio"),
                 () => CanCompose);
 
-            // The four below are declared, wired and permanently unavailable. Each needs a send
-            // route the app does not have yet - a document upload, a vCard, a location - and
-            // saying so through CanExecute means the flyout item and the tile grey themselves
-            // out from the same binding as the working ones. The day the route exists, only the
-            // predicate changes; no markup moves.
-            AttachCameraCommand = new RelayCommand(() => { }, () => false);
-            AttachFileCommand = new RelayCommand(() => { }, () => false);
+            // Contact / location stay unavailable until each has a send route.
+            // Camera opens the in-chat CameraPickView; document attach is live.
+            AttachCameraCommand = new RelayCommand(
+                () => CameraPickRequested?.Invoke(this, EventArgs.Empty),
+                () => CanCompose);
+            AttachFileCommand = new RelayCommand(
+                () => _ = RunSafeAsync(AttachDocumentAsync, "attach-file"),
+                () => CanCompose);
             AttachContactCommand = new RelayCommand(() => { }, () => false);
             AttachLocationCommand = new RelayCommand(() => { }, () => false);
 
@@ -204,6 +236,39 @@ namespace Unison.Core.ViewModels
             PinToStartCommand = new RelayCommand(
                 () => _ = ToggleWidgetPinAsync(),
                 () => ActiveChat != null && !string.IsNullOrWhiteSpace(ActiveChat.JID) && _shortcutService != null && _chatStore != null);
+            DeleteChatCommand = new RelayCommand(
+                () => _ = DeleteActiveChatAsync(),
+                () => CanDeleteActiveChat());
+            ArchiveChatCommand = new RelayCommand(
+                () => { },
+                () => ActiveChat != null &&
+                      !string.IsNullOrWhiteSpace(ActiveChat.JID) &&
+                      ActiveChat.Status == ChatStatus.Active);
+            UnarchiveChatCommand = new RelayCommand(
+                () => { },
+                () => ActiveChat != null &&
+                      !string.IsNullOrWhiteSpace(ActiveChat.JID) &&
+                      ActiveChat.Status == ChatStatus.Archived);
+            _messageActions.PropertyChanged += OnMessageActionsChanged;
+            CopySelectedMessageCommand = new RelayCommand(
+                () => SelectedMessage?.CopyCommand.Execute(null),
+                () => _messageActions.CanCopy);
+            ReplySelectedMessageCommand = new RelayCommand(
+                () => BeginReply(SelectedMessage),
+                () => _messageActions.CanReply);
+            DismissReplyCommand = new RelayCommand(DismissReply);
+            PinSelectedFor24HoursCommand = new RelayCommand(
+                () => _ = PinSelectedAsync(true, MessageActionSelection.PinFor24HoursSeconds),
+                () => _messageActions.CanPin);
+            PinSelectedFor7DaysCommand = new RelayCommand(
+                () => _ = PinSelectedAsync(true, MessageActionSelection.PinFor7DaysSeconds),
+                () => _messageActions.CanPin);
+            PinSelectedFor30DaysCommand = new RelayCommand(
+                () => _ = PinSelectedAsync(true, MessageActionSelection.PinFor30DaysSeconds),
+                () => _messageActions.CanPin);
+            UnpinSelectedMessageCommand = new RelayCommand(
+                () => _ = PinSelectedAsync(false, 0),
+                () => _messageActions.CanUnpin);
             MuteFor8HoursCommand = new RelayCommand(
                 () => _ = SetLocalMuteAsync(ChatMuteHelper.FromNow(ChatMuteHelper.EightHours)),
                 () => CanMuteActiveChat());
@@ -227,7 +292,11 @@ namespace Unison.Core.ViewModels
                 () => _ = AddContactAsync(),
                 () => CanAddToAddressBook);
 
-            _participants = new GroupParticipantLookup(_whatsAppService, _personStore, SelfListDisplayName);
+            CallPhoneCommand = new RelayCommand(
+                () => _ = CallPhoneAsync(),
+                () => CanCallPhone);
+
+            _participants = new GroupParticipantLookup(_participantContext, SelfListDisplayName);
             _participants.ParticipantAvatarChanged += OnParticipantAvatarChanged;
         }
 
@@ -276,11 +345,14 @@ namespace Unison.Core.ViewModels
         /// <summary>Wrap a domain message for the timeline (view load/sync paths).</summary>
         public ChatMessageViewModel CreateMessageVm(ChatMessage message)
         {
+            message?.EnsureKindFromLegacyFlags();
             var vm = _messageFactory.Create(message);
             if (vm != null)
             {
                 vm.PinnedChanged -= OnBubblePinnedChanged;
                 vm.PinnedChanged += OnBubblePinnedChanged;
+                vm.ReplyRequested -= OnBubbleReplyRequested;
+                vm.ReplyRequested += OnBubbleReplyRequested;
                 vm.AttachMentionLookup(ActiveChat?.MentionLookup);
             }
 
@@ -296,6 +368,7 @@ namespace Unison.Core.ViewModels
             }
 
             Messages.Clear();
+            IsDetachedFromEnd = false;
         }
 
         /// <summary>Removes one timeline row after <see cref="ChatMessageViewModel.Detach"/>.</summary>
@@ -335,7 +408,20 @@ namespace Unison.Core.ViewModels
             while (Messages.Count > maxCount)
             {
                 RemoveTimelineAt(Messages.Count - 1);
+                IsDetachedFromEnd = true;
             }
+        }
+
+        private bool _isDetachedFromEnd;
+
+        /// <summary>
+        /// True after load-more trimmed the newest rows: the window no longer reaches the latest
+        /// message, and only <see cref="ChatTimelineMergeMode.RejoinEnd"/> brings it back.
+        /// </summary>
+        public bool IsDetachedFromEnd
+        {
+            get => _isDetachedFromEnd;
+            private set => Set(ref _isDetachedFromEnd, value);
         }
 
         /// <summary>Clears top-scroll paging flags when switching conversations.</summary>
@@ -382,16 +468,65 @@ namespace Unison.Core.ViewModels
             }
 
             vm.PinnedChanged -= OnBubblePinnedChanged;
+            vm.ReplyRequested -= OnBubbleReplyRequested;
             vm.Detach();
         }
 
         private void OnBubblePinnedChanged(object sender, EventArgs e) =>
             MessagePinnedChanged?.Invoke(this, EventArgs.Empty);
 
+        private void OnBubbleReplyRequested(object sender, EventArgs e)
+        {
+            BeginReply(sender as ChatMessageViewModel);
+        }
+
+        private ChatMessageViewModel _composerReply;
+
+        /// <summary>The bubble the composer is replying to. The same instance the timeline shows.</summary>
+        public ChatMessageViewModel ComposerReply
+        {
+            get => _composerReply;
+            private set
+            {
+                if (ReferenceEquals(_composerReply, value))
+                {
+                    return;
+                }
+
+                _composerReply = value;
+                OnPropertyChanged(nameof(ComposerReply));
+                OnPropertyChanged(nameof(IsReplyBarOpen));
+            }
+        }
+
+        public bool IsReplyBarOpen => _composerReply != null;
+
+        public ICommand DismissReplyCommand { get; }
+
+        /// <summary>Opens the reply bar on this bubble and closes the Legacy action bar.</summary>
+        public void BeginReply(ChatMessageViewModel message)
+        {
+            if (message == null || message.Model == null || string.IsNullOrWhiteSpace(message.Model.Id))
+            {
+                return;
+            }
+
+            ComposerReply = message;
+            DismissMessageActions();
+        }
+
+        public void DismissReply()
+        {
+            ComposerReply = null;
+        }
+
         // ── Events ────────────────────────────────────────────────────────────
 
         public event EventHandler BackRequested;
         public event EventHandler MessageSent;
+
+        /// <summary>Chat detail should show <c>CameraPickView</c> over the conversation.</summary>
+        public event EventHandler CameraPickRequested;
 
         /// <summary>Raised after pin/unpin succeeds (view refreshes pinned banner).</summary>
         public event EventHandler MessagePinnedChanged;
@@ -458,6 +593,9 @@ namespace Unison.Core.ViewModels
                 RaiseComposerCommandsChanged();
                 OnPropertyChanged(nameof(IsGroupLockedForMessages));
                 OnPropertyChanged(nameof(CanLoadMore));
+                CloseMentionMenu();
+                DismissMessageActions();
+                DismissReply();
             }
         }
 
@@ -472,9 +610,256 @@ namespace Unison.Core.ViewModels
             get => _messageText;
             set
             {
-                Set(ref _messageText, value);
+                if (_composerHeld)
+                {
+                    Set(ref _messageText, value);
+                    RaiseSendMessageCanExecuteChanged();
+                    return;
+                }
+
+                string shown = _mentions.SetText(value);
+                Set(ref _messageText, shown);
+                if (!string.Equals(shown, value, StringComparison.Ordinal))
+                {
+                    OnPropertyChanged(nameof(MessageText));
+                }
+
                 RaiseSendMessageCanExecuteChanged();
             }
+        }
+
+        private readonly ComposerMentionDraft _mentions = new ComposerMentionDraft();
+        private bool _composerHeld;
+        private int _mentionTokenStart;
+        private int _mentionTokenLength;
+        private int _mentionTokenCaret;
+
+        /// <summary>Rows for the @ menu. Everyone stays first. Empty when the menu is closed.</summary>
+        public ObservableCollection<MentionChoice> MentionChoices { get; } = new ObservableCollection<MentionChoice>();
+
+        public bool IsMentionMenuOpen
+        {
+            get => _mentionMenuOpen;
+            private set => Set(ref _mentionMenuOpen, value);
+        }
+
+        private readonly MessageActionSelection _messageActions = new MessageActionSelection();
+
+        /// <summary>The bubble the Legacy command bar is acting on. Null when the bar is closed.</summary>
+        public ChatMessageViewModel SelectedMessage => _messageActions.Message;
+
+        public bool IsMessageActionsOpen => _messageActions.IsOpen;
+
+        public bool CanPinSelectedMessage => _messageActions.CanPin;
+
+        public bool CanUnpinSelectedMessage => _messageActions.CanUnpin;
+
+        public ICommand CopySelectedMessageCommand { get; }
+
+        public ICommand ReplySelectedMessageCommand { get; }
+
+        public ICommand PinSelectedFor24HoursCommand { get; }
+
+        public ICommand PinSelectedFor7DaysCommand { get; }
+
+        public ICommand PinSelectedFor30DaysCommand { get; }
+
+        public ICommand UnpinSelectedMessageCommand { get; }
+
+        /// <summary>
+        /// Opens the Legacy action bar on this bubble. The same bubble again closes it.
+        /// </summary>
+        public void SelectMessage(ChatMessageViewModel message)
+        {
+            _messageActions.Select(message);
+        }
+
+        public void DismissMessageActions()
+        {
+            _messageActions.Dismiss();
+        }
+
+        private void OnMessageActionsChanged(object sender, PropertyChangedEventArgs e)
+        {
+            OnPropertyChanged(nameof(SelectedMessage));
+            OnPropertyChanged(nameof(IsMessageActionsOpen));
+            OnPropertyChanged(nameof(CanPinSelectedMessage));
+            OnPropertyChanged(nameof(CanUnpinSelectedMessage));
+            (CopySelectedMessageCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (ReplySelectedMessageCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (PinSelectedFor24HoursCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (PinSelectedFor7DaysCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (PinSelectedFor30DaysCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (UnpinSelectedMessageCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        }
+
+        private async Task PinSelectedAsync(bool pin, uint durationSeconds)
+        {
+            ChatMessageViewModel message = SelectedMessage;
+            if (message == null)
+            {
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(message.Model.RemoteJid) && ActiveChat != null)
+            {
+                message.Model.RemoteJid = ActiveChat.JID;
+            }
+
+            await message.SetPinnedAsync(pin, durationSeconds);
+        }
+
+        private bool _mentionMenuOpen;
+
+        public int MentionSelectedIndex
+        {
+            get => _mentionSelectedIndex;
+            private set => Set(ref _mentionSelectedIndex, value);
+        }
+
+        private int _mentionSelectedIndex;
+
+        /// <summary>Where the caret belongs after a mention is inserted. -1 when nothing was inserted.</summary>
+        public int MentionInsertCaret { get; private set; } = -1;
+
+        /// <summary>
+        /// Opens or refreshes the @ menu from the field text and caret.
+        /// Groups only. A direct chat never offers members.
+        /// </summary>
+        public void UpdateMentionQuery(string text, int caret)
+        {
+            MentionInsertCaret = -1;
+            if (ActiveChat == null || !ActiveChat.IsGroup || ActiveChat.IsGroupLockedForMessages)
+            {
+                CloseMentionMenu();
+                return;
+            }
+
+            int at;
+            string query;
+            int length;
+            if (!MentionSearch.TryReadToken(text, caret, out at, out query, out length))
+            {
+                CloseMentionMenu();
+                return;
+            }
+
+            _mentionTokenStart = at;
+            _mentionTokenLength = length;
+            _mentionTokenCaret = caret;
+            string everyone = _strings != null
+                ? _strings.Get("ChatDetail_MentionEveryone", "Everyone")
+                : "Everyone";
+            string detail = _strings != null
+                ? _strings.Get("ChatDetail_MentionEveryoneDetail", "Mention all group members")
+                : "Mention all group members";
+            IReadOnlyList<MentionChoice> rows = MentionSearch.Search(
+                ActiveChat.GroupMembers,
+                query,
+                everyone,
+                detail,
+                ActiveChat.AvatarUrl,
+                IsCurrentMember);
+
+            MentionChoices.Clear();
+            for (int i = 0; i < rows.Count; i++)
+            {
+                MentionChoices.Add(rows[i]);
+            }
+
+            MentionSelectedIndex = -1;
+            MentionSelectedIndex = 0;
+            IsMentionMenuOpen = MentionChoices.Count > 0;
+        }
+
+        private bool IsCurrentMember(GroupMember member)
+        {
+            if (member == null || _jids == null)
+            {
+                return false;
+            }
+
+            if (SelfIdentity.IsSelf(member.Jid, _jids) || SelfIdentity.IsSelf(member.Lid, _jids))
+            {
+                return true;
+            }
+
+            string phone = member.PhoneNumber;
+            if (string.IsNullOrWhiteSpace(phone))
+            {
+                return false;
+            }
+
+            if (phone.IndexOf('@') < 0)
+            {
+                phone = phone + "@s.whatsapp.net";
+            }
+
+            return SelfIdentity.IsSelf(phone, _jids);
+        }
+
+        public void MoveMentionSelection(int delta)
+        {
+            if (!IsMentionMenuOpen || MentionChoices.Count == 0)
+            {
+                return;
+            }
+
+            int next = _mentionSelectedIndex + delta;
+            if (next < 0)
+            {
+                next = MentionChoices.Count - 1;
+            }
+            else if (next >= MentionChoices.Count)
+            {
+                next = 0;
+            }
+
+            MentionSelectedIndex = next;
+        }
+
+        /// <summary>Inserts the highlighted row. Returns false when the menu is closed.</summary>
+        public bool TryAcceptSelectedMention()
+        {
+            if (!IsMentionMenuOpen || MentionChoices.Count == 0)
+            {
+                return false;
+            }
+
+            int index = _mentionSelectedIndex;
+            if (index < 0 || index >= MentionChoices.Count)
+            {
+                index = 0;
+            }
+
+            AcceptMention(MentionChoices[index]);
+            return true;
+        }
+
+        public void AcceptMention(MentionChoice choice)
+        {
+            if (choice == null)
+            {
+                return;
+            }
+
+            string shown = _mentions.Insert(choice, _mentionTokenCaret, _mentionTokenLength);
+            MentionInsertCaret = _mentions.CaretAfterInsert(_mentionTokenStart, choice.Name);
+            _messageText = shown;
+            OnPropertyChanged(nameof(MessageText));
+            RaiseSendMessageCanExecuteChanged();
+            CloseMentionMenu();
+        }
+
+        private void CloseMentionMenu()
+        {
+            if (MentionChoices.Count > 0)
+            {
+                MentionChoices.Clear();
+            }
+
+            MentionSelectedIndex = 0;
+            IsMentionMenuOpen = false;
         }
 
         public bool IsSending
@@ -599,13 +984,10 @@ namespace Unison.Core.ViewModels
         /// <summary>Opens the music picker and sends the clip as a non-voice audio message.</summary>
         public ICommand AttachAudioCommand { get; }
 
-        /// <summary>Take a photo. Unavailable: there is no capture surface yet.</summary>
+        /// <summary>Opens the in-chat camera overlay (<see cref="CameraPickViewModel"/>).</summary>
         public ICommand AttachCameraCommand { get; }
 
-        /// <summary>
-        /// Send an arbitrary document. Unavailable: the socket can build and upload a
-        /// DocumentMessage, but nothing in the app asks it to.
-        /// </summary>
+        /// <summary>Opens the document picker and sends a DocumentMessage.</summary>
         public ICommand AttachFileCommand { get; }
 
         /// <summary>Share a contact card. Unavailable: no vCard send route.</summary>
@@ -629,6 +1011,18 @@ namespace Unison.Core.ViewModels
         /// <summary>Pins/unpins the active chat Start live tile (toggles SQLite + SecondaryTile).</summary>
         public ICommand PinToStartCommand { get; }
 
+        /// <summary>
+        /// Deletes the open conversation for the account after asking, then leaves the surface -
+        /// there is nothing behind it once the messages are gone.
+        /// </summary>
+        public ICommand DeleteChatCommand { get; }
+
+        /// <summary>Placeholder until archive outbound is wired.</summary>
+        public ICommand ArchiveChatCommand { get; }
+
+        /// <summary>Placeholder until unarchive outbound is wired.</summary>
+        public ICommand UnarchiveChatCommand { get; }
+
         public ICommand MuteFor8HoursCommand { get; }
         public ICommand MuteFor1WeekCommand { get; }
         public ICommand MuteForeverCommand { get; }
@@ -645,24 +1039,11 @@ namespace Unison.Core.ViewModels
 
         public ICommand AddContactCommand { get; }
 
-        /// <summary>Label for the live-tile pin menu (localized via string service when bound in code).</summary>
-        public string LiveTilePinMenuLabel
-        {
-            get
-            {
-                bool pinned = ActiveChat != null && ActiveChat.IsWidgetPinned;
-                if (pinned)
-                {
-                    return _strings != null
-                        ? _strings.Get("ChatDetail_UnpinFromStart.Text", "Unpin from Start")
-                        : "Unpin from Start";
-                }
+        /// <summary>1:1 only: confirm, then open the system dialer for the contact phone.</summary>
+        public ICommand CallPhoneCommand { get; }
 
-                return _strings != null
-                    ? _strings.Get("ChatDetail_PinToStart.Text", "Pin to Start")
-                    : "Pin to Start";
-            }
-        }
+        /// <summary>Whether the Start tile for this chat is pinned (drives pin/unpin menu Visibility).</summary>
+        public bool IsWidgetPinned => ActiveChat != null && ActiveChat.IsWidgetPinned;
 
         /// <summary>True when mute submenu should show duration options (not unmuted→unmute-only).</summary>
         public bool ShowMuteDurationOptions => ActiveChat != null && !ActiveChat.IsMutedLocally;
@@ -676,10 +1057,55 @@ namespace Unison.Core.ViewModels
             !ActiveChat.IsPersonal &&
             _contactService.CanAddToAddressBook(ActiveChat.JID);
 
-        public string AddContactLabel =>
-            _strings != null
-                ? _strings.Get("ChatDetail_AddContact.Text", "Add contact")
-                : "Add contact";
+        /// <summary>1:1 chats with a resolvable phone number.</summary>
+        public bool CanCallPhone =>
+            ActiveChat != null &&
+            !ActiveChat.IsGroup &&
+            _uriLauncher != null &&
+            !string.IsNullOrEmpty(ResolveActiveChatPhone());
+
+        private string ResolveActiveChatPhone()
+        {
+            ChatItem chat = ActiveChat;
+            if (chat == null || chat.IsGroup)
+            {
+                return null;
+            }
+
+            if (_contactService != null)
+            {
+                string resolved = _contactService.TryResolvePhone(chat.JID);
+                if (!string.IsNullOrEmpty(resolved))
+                {
+                    return resolved;
+                }
+            }
+
+            return JidHelper.TryPhoneFromJid(chat.JID);
+        }
+
+        private async Task CallPhoneAsync()
+        {
+            if (!CanCallPhone)
+            {
+                return;
+            }
+
+            ChatItem chat = ActiveChat;
+            string phone = ResolveActiveChatPhone();
+            string label = chat.GetNameResolved(_strings);
+            if (string.IsNullOrWhiteSpace(label))
+            {
+                label = phone;
+            }
+
+            await PhoneCallPrompt.ConfirmAndCallAsync(
+                phone,
+                label,
+                _dialogs,
+                _uriLauncher,
+                _strings).ConfigureAwait(false);
+        }
 
         /// <summary>
         /// Re-reads the local chat row before the overflow menu is built. Mute can be changed from
@@ -707,27 +1133,64 @@ namespace Unison.Core.ViewModels
 
             OnPropertyChanged(nameof(ShowMuteDurationOptions));
             OnPropertyChanged(nameof(ShowUnmuteOption));
-            OnPropertyChanged(nameof(LiveTilePinMenuLabel));
+            OnPropertyChanged(nameof(IsWidgetPinned));
             RaiseMuteCommandsCanExecuteChanged();
             RaiseCanAddToAddressBook();
         }
 
         private void Contacts_DisplayNamesUpdated(object sender, EventArgs e)
         {
+            GroupParticipantLookup.InvalidateDirectChatIndex();
+
             if (_dispatcher != null)
             {
-                _ = _dispatcher.RunAsync(RaiseCanAddToAddressBook);
+                _ = _dispatcher.RunAsync(RefreshGroupAuthorLabelsAfterNamesChanged);
                 return;
             }
 
+            RefreshGroupAuthorLabelsAfterNamesChanged();
+        }
+
+        /// <summary>
+        /// Roster / Person / push names often arrive after the first run layout. Rebuild the
+        /// participant index and re-label visible bubbles so short JIDs do not stick until leave/reenter.
+        /// </summary>
+        private void RefreshGroupAuthorLabelsAfterNamesChanged()
+        {
             RaiseCanAddToAddressBook();
+
+            ChatItem chat = ActiveChat;
+            if (chat == null || !LooksLikeGroupChat(chat) || Messages.Count == 0)
+            {
+                return;
+            }
+
+            RebuildParticipantLookup();
+
+            var models = new List<ChatMessage>(Messages.Count);
+            for (int i = 0; i < Messages.Count; i++)
+            {
+                ChatMessage model = Messages[i]?.Model;
+                if (model != null)
+                {
+                    models.Add(model);
+                }
+            }
+
+            if (models.Count == 0)
+            {
+                return;
+            }
+
+            ApplyMessageRunLayout(models, isGroup: true, chat);
         }
 
         private void RaiseCanAddToAddressBook()
         {
             OnPropertyChanged(nameof(CanAddToAddressBook));
-            OnPropertyChanged(nameof(AddContactLabel));
+            OnPropertyChanged(nameof(CanCallPhone));
             (AddContactCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (CallPhoneCommand as RelayCommand)?.RaiseCanExecuteChanged();
         }
 
         private async Task AddContactAsync()
@@ -777,14 +1240,10 @@ namespace Unison.Core.ViewModels
                 return;
             }
 
-            ChatDetailInfoViewModel previous = ChatDetailInfo;
-            ChatDetailInfoViewModel next = chat.IsGroup
+            ShowInfoPane(chat.IsGroup
                 ? _infoFactory.CreateGroup(chat)
-                : _infoFactory.CreateUser(chat);
+                : _infoFactory.CreateUser(chat));
 
-            ChatDetailInfo = next;
-            IsChatDetailInfoOpen = true;
-            previous?.Detach();
             (OpenChatDetailInfoCommand as RelayCommand)?.RaiseCanExecuteChanged();
             (OpenChatDetailInfoFromAvatarCommand as RelayCommand)?.RaiseCanExecuteChanged();
         }
@@ -797,10 +1256,39 @@ namespace Unison.Core.ViewModels
                 return;
             }
 
+            ShowInfoPane(_infoFactory.CreateUser(contact));
+        }
+
+        /// <summary>
+        /// Swaps the pane, taking the previous one down first. The delete hook is attached here
+        /// rather than at each call site so a pane can never be shown without it.
+        /// </summary>
+        private void ShowInfoPane(ChatDetailInfoViewModel next)
+        {
             ChatDetailInfoViewModel previous = ChatDetailInfo;
-            ChatDetailInfo = _infoFactory.CreateUser(contact);
-            IsChatDetailInfoOpen = true;
+            if (previous != null)
+            {
+                previous.ChatDeleted -= ChatDetailInfo_ChatDeleted;
+            }
+
+            if (next != null)
+            {
+                next.ChatDeleted += ChatDetailInfo_ChatDeleted;
+            }
+
+            ChatDetailInfo = next;
+            IsChatDetailInfoOpen = next != null;
             previous?.Detach();
+        }
+
+        /// <summary>
+        /// The info pane deleted the conversation it was describing, so the whole surface goes -
+        /// closing only the pane would leave an empty timeline for a chat that is gone.
+        /// </summary>
+        private void ChatDetailInfo_ChatDeleted(object sender, EventArgs e)
+        {
+            CloseChatDetailInfo();
+            BackRequested?.Invoke(this, EventArgs.Empty);
         }
 
         /// <summary>Opens the group-member profile pane (media/files filtered to that author).</summary>
@@ -815,14 +1303,10 @@ namespace Unison.Core.ViewModels
                 member,
                 participantJid ?? member.Jid ?? member.Lid ?? member.PhoneNumber,
                 ActiveChat,
-                _whatsAppService,
-                _personStore,
+                _participantContext,
                 nameHint);
 
-            ChatDetailInfoViewModel previous = ChatDetailInfo;
-            ChatDetailInfo = _infoFactory.CreateGroupMember(ActiveChat, member);
-            IsChatDetailInfoOpen = true;
-            previous?.Detach();
+            ShowInfoPane(_infoFactory.CreateGroupMember(ActiveChat, member));
         }
 
         /// <summary>
@@ -905,9 +1389,7 @@ namespace Unison.Core.ViewModels
                 return;
             }
 
-            string canonical = _whatsAppService != null
-                ? _whatsAppService.GetCanonicalJid(participantJid)
-                : JidHelper.Normalize(participantJid);
+            string canonical = _jids.GetCanonicalJid(participantJid);
 
             for (int i = 0; i < Messages.Count; i++)
             {
@@ -943,9 +1425,7 @@ namespace Unison.Core.ViewModels
                 return true;
             }
 
-            string leftCanonical = _whatsAppService != null
-                ? _whatsAppService.GetCanonicalJid(left)
-                : JidHelper.Normalize(left);
+            string leftCanonical = _jids.GetCanonicalJid(left);
             return !string.IsNullOrWhiteSpace(leftCanonical) &&
                    !string.IsNullOrWhiteSpace(rightCanonical) &&
                    string.Equals(leftCanonical, rightCanonical, StringComparison.OrdinalIgnoreCase);
@@ -996,6 +1476,11 @@ namespace Unison.Core.ViewModels
             }
 
             ChatDetailInfoViewModel previous = ChatDetailInfo;
+            if (previous != null)
+            {
+                previous.ChatDeleted -= ChatDetailInfo_ChatDeleted;
+            }
+
             IsChatDetailInfoOpen = false;
             ChatDetailInfo = null;
             previous?.Detach();
@@ -1012,20 +1497,14 @@ namespace Unison.Core.ViewModels
         /// </remarks>
         public async Task MarkChatOpenedAsync(ChatItem chat)
         {
-            if (chat == null)
+            if (chat == null || _chatService == null)
             {
                 return;
             }
 
             try
             {
-                if (_chatService != null)
-                {
-                    await _chatService.MarkReadAsync(chat);
-                    return;
-                }
-
-                await _whatsAppService.ClearUnreadForChatAsync(chat.JID);
+                await _chatService.MarkReadAsync(chat);
             }
             catch (Exception ex)
             {
@@ -1058,7 +1537,7 @@ namespace Unison.Core.ViewModels
             RaiseMuteCommandsCanExecuteChanged();
             (OpenChatDetailInfoCommand as RelayCommand)?.RaiseCanExecuteChanged();
             (OpenChatDetailInfoFromAvatarCommand as RelayCommand)?.RaiseCanExecuteChanged();
-            OnPropertyChanged(nameof(LiveTilePinMenuLabel));
+            OnPropertyChanged(nameof(IsWidgetPinned));
             OnPropertyChanged(nameof(ShowMuteDurationOptions));
             OnPropertyChanged(nameof(ShowUnmuteOption));
             OnPropertyChanged(nameof(IsGroupLockedForMessages));
@@ -1066,6 +1545,11 @@ namespace Unison.Core.ViewModels
             if (LooksLikeGroupChat(chat))
             {
                 _ = RefreshGroupSendPermissionsSafeAsync(chat.JID);
+
+                // Opening a group resolves its senders here (roster + contacts) while the list row
+                // may still be sitting on the number a history chunk left behind. Ask the strip to
+                // catch up so the two do not disagree on the same person.
+                _authorProjection?.Refresh();
             }
 
             if (chat == null)
@@ -1108,19 +1592,31 @@ namespace Unison.Core.ViewModels
             {
                 OnPropertyChanged(nameof(IsGroupLockedForMessages));
                 RaiseComposerCommandsChanged();
+                if (ActiveChat == null || ActiveChat.IsGroupLockedForMessages)
+                {
+                    CloseMentionMenu();
+                }
+            }
+
+            if (e.PropertyName == nameof(ChatItem.GroupMembers) && IsMentionMenuOpen)
+            {
+                UpdateMentionQuery(_messageText, _mentionTokenCaret);
             }
         }
 
         private async Task RefreshGroupSendPermissionsSafeAsync(string groupJid)
         {
-            if (string.IsNullOrWhiteSpace(groupJid) || _whatsAppService == null)
+            if (string.IsNullOrWhiteSpace(groupJid) || _groupService == null)
             {
                 return;
             }
 
             try
             {
-                await _whatsAppService.RefreshGroupSendPermissionsAsync(groupJid).ConfigureAwait(false);
+                await _groupService.EnsureGroupRosterLoadedFromStoreAsync(groupJid)
+                    .ConfigureAwait(false);
+                await _groupService.RefreshGroupSendPermissionsAsync(groupJid)
+                    .ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -1146,19 +1642,15 @@ namespace Unison.Core.ViewModels
                     if (tileExists != chat.IsWidgetPinned)
                     {
                         chat.IsWidgetPinned = tileExists;
-                        await _chatStore.UpsertAsync(
-                            chat.JID,
-                            chat.LocalStatus,
-                            chat.IsWidgetPinned,
-                            chat.IsChatPinned,
-                            chat.MutedUntil).ConfigureAwait(false);
+                        await _chatStore.SetWidgetPinnedAsync(chat.JID, chat.IsWidgetPinned)
+                            .ConfigureAwait(false);
                     }
                 }
 
                 await _dispatcher.RunAsync(() =>
                 {
                     RaiseMuteCommandsCanExecuteChanged();
-                    OnPropertyChanged(nameof(LiveTilePinMenuLabel));
+                    OnPropertyChanged(nameof(IsWidgetPinned));
                     OnPropertyChanged(nameof(ShowMuteDurationOptions));
                     OnPropertyChanged(nameof(ShowUnmuteOption));
                 }).ConfigureAwait(false);
@@ -1174,6 +1666,31 @@ namespace Unison.Core.ViewModels
             return ActiveChat != null &&
                    !string.IsNullOrWhiteSpace(ActiveChat.JID) &&
                    _chatStore != null;
+        }
+
+        private bool CanDeleteActiveChat()
+        {
+            return ActiveChat != null &&
+                   !string.IsNullOrWhiteSpace(ActiveChat.JID) &&
+                   _chatService != null;
+        }
+
+        /// <summary>
+        /// The timeline is closed on success rather than emptied: the conversation no longer
+        /// exists, so a chat detail still open on it would be showing a chat that is gone.
+        /// </summary>
+        private async Task DeleteActiveChatAsync()
+        {
+            bool deleted = await ChatDeletionPrompt.ConfirmAndDeleteAsync(
+                ActiveChat,
+                _chatService,
+                _dialogs,
+                _strings);
+
+            if (deleted)
+            {
+                BackRequested?.Invoke(this, EventArgs.Empty);
+            }
         }
 
         private async Task ToggleWidgetPinAsync()
@@ -1198,13 +1715,8 @@ namespace Unison.Core.ViewModels
                 }
 
                 chat.IsWidgetPinned = nextPinned;
-                await _chatStore.UpsertAsync(
-                    chat.JID,
-                    chat.LocalStatus,
-                    chat.IsWidgetPinned,
-                    chat.IsChatPinned,
-                    chat.MutedUntil);
-                OnPropertyChanged(nameof(LiveTilePinMenuLabel));
+                await _chatStore.SetWidgetPinnedAsync(chat.JID, chat.IsWidgetPinned);
+                OnPropertyChanged(nameof(IsWidgetPinned));
             }
             catch (Exception ex)
             {
@@ -1223,12 +1735,7 @@ namespace Unison.Core.ViewModels
             try
             {
                 chat.MutedUntil = mutedUntilUnixSeconds;
-                await _chatStore.UpsertAsync(
-                    chat.JID,
-                    chat.LocalStatus,
-                    chat.IsWidgetPinned,
-                    chat.IsChatPinned,
-                    chat.MutedUntil);
+                await _chatStore.SetMutedUntilAsync(chat.JID, chat.MutedUntil);
                 RaiseMuteCommandsCanExecuteChanged();
                 OnPropertyChanged(nameof(ShowMuteDurationOptions));
                 OnPropertyChanged(nameof(ShowUnmuteOption));
@@ -1313,6 +1820,55 @@ namespace Unison.Core.ViewModels
         }
 
         /// <summary>
+        /// Inserts chronological older rows that are not already on screen. Returns how many
+        /// bubble VMs were prepended.
+        /// </summary>
+        private int PrependOlderPage(IList<ChatMessage> older, string chatJid)
+        {
+            if (older == null || older.Count == 0)
+            {
+                return 0;
+            }
+
+            RemovePreviewFallbackMessages();
+            StampGroupRemoteJid(older, chatJid);
+
+            var existingIds = new HashSet<string>(
+                Messages.Where(m => m?.Id != null).Select(m => m.Id),
+                StringComparer.Ordinal);
+
+            int prepended = 0;
+            for (int i = 0; i < older.Count; i++)
+            {
+                ChatMessage msg = older[i];
+                if (msg == null)
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrEmpty(msg.Id) && existingIds.Contains(msg.Id))
+                {
+                    continue;
+                }
+
+                InsertTimelineMessage(msg);
+                if (!string.IsNullOrEmpty(msg.Id))
+                {
+                    existingIds.Add(msg.Id);
+                }
+
+                prepended++;
+            }
+
+            if (prepended > 0)
+            {
+                TrimTimelineNewestToMax(MaxUiMessageWindow);
+            }
+
+            return prepended;
+        }
+
+        /// <summary>
         /// Prepends an older page into the UI window (factory VMs). View calls this when scroll is near top
         /// and <see cref="CanLoadMore"/> is true; scroll offset adjustment stays in code-behind.
         /// </summary>
@@ -1330,7 +1886,7 @@ namespace Unison.Core.ViewModels
             {
                 string chatJid = _activeChat.JID;
                 ChatMessageViewModel oldestVm = Messages.Count > 0 ? Messages[0] : null;
-                var older = await _messageService.LoadMoreMessagesAsync(
+                List<ChatMessage> older = await _messageService.LoadMoreMessagesAsync(
                     chatJid,
                     oldestVm?.Timestamp,
                     oldestVm?.Id);
@@ -1343,41 +1899,40 @@ namespace Unison.Core.ViewModels
 
                 if (older != null && older.Count > 0)
                 {
-                    _emptyLoadAttempts = 0;
-                    RemovePreviewFallbackMessages();
-                    StampGroupRemoteJid(older, chatJid);
+                    int prepended = PrependOlderPage(older, chatJid);
 
-                    var existingIds = new HashSet<string>(
-                        Messages.Where(m => m?.Id != null).Select(m => m.Id),
-                        StringComparer.Ordinal);
-
-                    int prepended = 0;
-                    for (int i = 0; i < older.Count; i++)
+                    // Self-chat / dual-key overlap: SQLite can return a page already on screen.
+                    // Advance past that tip once so scroll-up is not stuck with prepended=0.
+                    if (TimelineLoadMorePage.IsDuplicateOnlyPage(older.Count, prepended))
                     {
-                        var msg = older[i];
-                        if (msg == null)
+                        ChatMessage tip = TimelineLoadMorePage.OldestTip(older);
+                        if (tip != null)
                         {
-                            continue;
-                        }
+                            older = await _messageService.LoadMoreMessagesAsync(
+                                chatJid,
+                                tip.Timestamp,
+                                tip.Id);
 
-                        if (!string.IsNullOrEmpty(msg.Id) && existingIds.Contains(msg.Id))
-                        {
-                            continue;
-                        }
+                            if (_activeChat == null ||
+                                !string.Equals(_activeChat.JID, chatJid, StringComparison.OrdinalIgnoreCase))
+                            {
+                                return result;
+                            }
 
-                        InsertTimelineMessage(msg);
-                        if (!string.IsNullOrEmpty(msg.Id))
-                        {
-                            existingIds.Add(msg.Id);
+                            if (older != null && older.Count > 0)
+                            {
+                                prepended = PrependOlderPage(older, chatJid);
+                            }
                         }
-
-                        prepended++;
                     }
 
-                    TrimTimelineNewestToMax(MaxUiMessageWindow);
-                    result.PrependedCount = prepended;
-                    OnPropertyChanged(nameof(CanLoadMore));
-                    return result;
+                    if (prepended > 0)
+                    {
+                        _emptyLoadAttempts = 0;
+                        result.PrependedCount = prepended;
+                        OnPropertyChanged(nameof(CanLoadMore));
+                        return result;
+                    }
                 }
 
                 bool requestedOnDemand =
@@ -1480,6 +2035,82 @@ namespace Unison.Core.ViewModels
         }
 
         /// <summary>
+        /// Corrects the chat's list row from the timeline just opened, then asks the store for a
+        /// reconcile in case SQLite holds something newer. See <see cref="TimelineListStrip"/>.
+        /// </summary>
+        public void SyncListStripFromTimeline(
+            ChatItem chat,
+            string requestedJid,
+            IReadOnlyList<ChatMessage> visibleMessages)
+        {
+            if (chat == null)
+            {
+                return;
+            }
+
+            ChatMessage tip = TimelineListStrip.PickTip(visibleMessages);
+            if (tip == null)
+            {
+                _ = _chatService?.ReconcileChatPreviewsFromSqliteAsync(new[] { requestedJid }, "chat-open-empty");
+                return;
+            }
+
+            bool isGroup = chat.IsGroup ||
+                (chat.JID ?? string.Empty).EndsWith("@g.us", StringComparison.OrdinalIgnoreCase);
+            string rawPreview = ChatPreviewNormalizer.FormatListPreview(tip, isGroup);
+            string stripParticipant = isGroup
+                ? ParticipantStripIdentity.PreferForDisplay(
+                    tip.ParticipantJid,
+                    _jids.GetCanonicalJid(tip.ParticipantJid))
+                : null;
+            string authorPrefix = ChatPreviewNormalizer.FormatListAuthorPrefix(
+                tip,
+                isGroup,
+                _strings?.Get("Chat_SelfFallbackName", "You") ?? "You",
+                stripParticipant);
+            ChatPreviewNormalizer.Normalize(
+                rawPreview,
+                ChatPreviewNormalizer.InferKindFromMessage(tip),
+                out var previewKind,
+                out var preview);
+            MessageSendState sendState = HistoryLiveMessageMapper.FromStatus(tip.Status, tip.IsFromMe);
+            string senderName = tip.IsFromMe ? null : tip.SenderName;
+
+            if (TimelineListStrip.ShouldReplace(chat, tip, preview, previewKind, authorPrefix, sendState))
+            {
+                DateTime tipUtc = WhatsAppMapper.ToUtc(tip.Timestamp);
+                chat.LastMessage = preview;
+                chat.LastMessageAuthor = authorPrefix;
+                chat.LastMessageKind = previewKind;
+                chat.LastMessageMentionedJids = tip.MentionedJids != null && tip.MentionedJids.Count > 0
+                    ? new List<string>(tip.MentionedJids)
+                    : null;
+                chat.LastMessageIsFromMe = tip.IsFromMe;
+                chat.LastMessageSendState = sendState;
+                chat.LastMessageId = tip.Id;
+                chat.LastMessageTimestampUtc = tipUtc;
+                chat.Timestamp = WhatsAppMapper.FormatTimestamp(
+                    tip.Timestamp,
+                    _strings?.Get("Common_Yesterday", "Yesterday") ?? "Yesterday");
+                LiveChatPreviewApplier.ApplyAuthorParts(chat, stripParticipant, senderName, authorPrefix);
+                _chatService?.PersistChatListRows(new[] { chat });
+                System.Diagnostics.Debug.WriteLine(
+                    "[ChatDetailViewModel] List preview from newest tip id=" + (tip.Id ?? "?") +
+                    " fromMe=" + tip.IsFromMe + " ts=" + tipUtc.ToString("O"));
+            }
+            else if (isGroup &&
+                     !string.IsNullOrWhiteSpace(tip.Id) &&
+                     string.Equals(chat.LastMessageId, tip.Id, StringComparison.Ordinal))
+            {
+                // Same tip the bubble just named — promote author without moving the strip time.
+                LiveChatPreviewApplier.ApplyAuthorParts(chat, stripParticipant, senderName, authorPrefix);
+                _chatService?.PersistChatListRows(new[] { chat });
+            }
+
+            _ = _chatService?.ReconcileChatPreviewsFromSqliteAsync(new[] { requestedJid }, "chat-open");
+        }
+
+        /// <summary>
         /// Empty timeline while the chat list already shows a preview: surfaces that preview as an
         /// ephemeral bubble and asks the phone for history. Returns the model so the view can run
         /// its group-run layout over it, or null when the chat had nothing to show.
@@ -1517,16 +2148,25 @@ namespace Unison.Core.ViewModels
 
         /// <summary>
         /// Merges a freshly loaded page into the open timeline: strips preview bubbles, refreshes
-        /// rows we already show, inserts what is new in order, then trims to the UI window.
+        /// rows we already show, inserts what is new in order. Only a reader at the end gets the
+        /// oldest rows trimmed; <paramref name="followingEnd"/> false leaves every row under the user.
         /// Returns true when the collection changed, so the view knows to redo runs / scroll.
         /// </summary>
-        public bool MergeTimelineFromService(IList<ChatMessage> serviceMessages, string requestedJid)
+        public bool MergeTimelineFromService(IList<ChatMessage> serviceMessages, string requestedJid, bool followingEnd = true)
         {
             if (serviceMessages == null || serviceMessages.Count == 0)
             {
                 return false;
             }
 
+            ChatTimelineMergeMode mode = ChatTimelineLiveMerge.Choose(followingEnd, IsDetachedFromEnd);
+            if (mode == ChatTimelineMergeMode.RejoinEnd)
+            {
+                RejoinTimelineEnd(serviceMessages, requestedJid);
+                return true;
+            }
+
+            DateTime? newestShown = Messages.Count > 0 ? Messages[Messages.Count - 1]?.Timestamp : null;
             int countBeforeFallbackStrip = Messages.Count;
             RemovePreviewFallbackMessages();
             bool changed = Messages.Count != countBeforeFallbackStrip;
@@ -1560,6 +2200,11 @@ namespace Unison.Core.ViewModels
                     continue;
                 }
 
+                if (!ChatTimelineLiveMerge.ShouldInsert(msg.Timestamp, newestShown, IsDetachedFromEnd))
+                {
+                    continue;
+                }
+
                 StampGroupRemoteJid(new[] { msg }, requestedJid);
                 ChatMessageViewModel inserted = InsertTimelineMessage(msg);
                 if (inserted != null && !string.IsNullOrWhiteSpace(msg.Id))
@@ -1570,8 +2215,32 @@ namespace Unison.Core.ViewModels
                 changed = true;
             }
 
-            TrimTimelineToMax(MaxUiMessageWindow);
+            if (mode == ChatTimelineMergeMode.FollowEnd)
+            {
+                TrimTimelineToMax(MaxUiMessageWindow);
+            }
+
             return changed;
+        }
+
+        /// <summary>
+        /// The window lost its newest rows to load-more, so the recent page cannot be stitched onto
+        /// it without a gap. The reader asked for the end: show the latest page instead.
+        /// </summary>
+        private void RejoinTimelineEnd(IList<ChatMessage> serviceMessages, string requestedJid)
+        {
+            var latest = serviceMessages.Where(m => m != null).ToList();
+            ChatMessageOrder.SortInPlace(latest);
+            if (latest.Count > InitialUiMessageWindow)
+            {
+                latest.RemoveRange(0, latest.Count - InitialUiMessageWindow);
+            }
+
+            StampGroupRemoteJid(latest, requestedJid);
+            ReplaceTimelineWindow(latest);
+            _hasReachedStart = false;
+            _emptyLoadAttempts = 0;
+            OnPropertyChanged(nameof(CanLoadMore));
         }
 
         /// <summary>
@@ -1648,11 +2317,58 @@ namespace Unison.Core.ViewModels
             {
                 target.AudioUri = source.AudioUri;
             }
+
+            // Document (and kind in general): a sync reload used to leave Kind/Text while the
+            // live row already carried Document — the bubble stayed as plain text.
+            if (source.Kind != ChatMessageKind.Text || source.IsDocument)
+            {
+                target.Kind = source.Kind;
+            }
+
+            if (source.IsDocument ||
+                !string.IsNullOrWhiteSpace(source.DocumentUri) ||
+                !string.IsNullOrWhiteSpace(source.DocumentFileName) ||
+                !string.IsNullOrWhiteSpace(source.DocumentMediaKeyBase64))
+            {
+                if (!string.IsNullOrWhiteSpace(source.DocumentUri))
+                {
+                    target.DocumentUri = source.DocumentUri;
+                }
+
+                if (!string.IsNullOrWhiteSpace(source.DocumentFileName))
+                {
+                    target.DocumentFileName = source.DocumentFileName;
+                }
+
+                if (!string.IsNullOrWhiteSpace(source.DocumentMimeType))
+                {
+                    target.DocumentMimeType = source.DocumentMimeType;
+                }
+
+                if (!string.IsNullOrWhiteSpace(source.DocumentMediaKeyBase64))
+                {
+                    target.DocumentMediaKeyBase64 = source.DocumentMediaKeyBase64;
+                }
+
+                if (source.DocumentFileLengthBytes > 0)
+                {
+                    target.DocumentFileLengthBytes = source.DocumentFileLengthBytes;
+                }
+
+                if (target.Kind == ChatMessageKind.Text)
+                {
+                    target.Kind = ChatMessageKind.Document;
+                }
+
+                target.NotifyDocumentDownloadStateChanged();
+            }
+
+            target.EnsureKindFromLegacyFlags();
         }
 
         /// <summary>
         /// Subscribe + wait for presence (or group hint). Raises <see cref="PresenceAnimationRequested"/>.
-        /// View skips calling this on Windows Mobile (cosmetic cost).
+        /// The WhatsApp Web and Unison shells skip this on Windows Mobile. The legacy shell does not.
         /// </summary>
         public void StartPresenceWatch(string jid)
         {
@@ -1708,6 +2424,8 @@ namespace Unison.Core.ViewModels
             RaiseSendMessageCanExecuteChanged();
             (AttachMediaCommand as RelayCommand)?.RaiseCanExecuteChanged();
             (AttachAudioCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (AttachCameraCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (AttachFileCommand as RelayCommand)?.RaiseCanExecuteChanged();
             (StartRecordingCommand as RelayCommand)?.RaiseCanExecuteChanged();
             (CancelRecordingCommand as RelayCommand)?.RaiseCanExecuteChanged();
             (SendRecordingCommand as RelayCommand)?.RaiseCanExecuteChanged();
@@ -1719,6 +2437,9 @@ namespace Unison.Core.ViewModels
         private void RaisePinToStartCanExecuteChanged()
         {
             (PinToStartCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (DeleteChatCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (ArchiveChatCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (UnarchiveChatCommand as RelayCommand)?.RaiseCanExecuteChanged();
             RaiseMuteCommandsCanExecuteChanged();
         }
 
@@ -1773,7 +2494,10 @@ namespace Unison.Core.ViewModels
                         break;
                     }
 
-                    if (!subscribed && !string.IsNullOrEmpty(subscribeJid) && _whatsAppService.IsConnected)
+                    if (!subscribed &&
+                        !string.IsNullOrEmpty(subscribeJid) &&
+                        _connectionService != null &&
+                        _connectionService.IsConnected)
                     {
                         await _messageService.SubscribeToPresenceAsync(subscribeJid);
                         subscribed = true;
@@ -1879,10 +2603,20 @@ namespace Unison.Core.ViewModels
         {
             if (string.IsNullOrWhiteSpace(MessageText) || _activeChat == null) return;
 
-            string text = MessageText;
             string jid = _activeChat.JID;
+            OutgoingTextMentions wire = _mentions.GetMessage();
+            if (ComposerReply != null)
+            {
+                wire.Quote = OutgoingQuote.From(ComposerReply.Model, jid);
+            }
+            string text = _mentions.Text;
             IsSending = true;
-            MessageText = string.Empty;
+            _composerHeld = true;
+            _messageText = string.Empty;
+            OnPropertyChanged(nameof(MessageText));
+            CloseMentionMenu();
+            DismissReply();
+            RaiseSendMessageCanExecuteChanged();
             // Optimistic bubble is queued inside the service before transport completes —
             // ask the view to stick to bottom immediately.
             MessageSent?.Invoke(this, EventArgs.Empty);
@@ -1890,17 +2624,27 @@ namespace Unison.Core.ViewModels
 
             try
             {
-                await _messageService.SendTextMessageAsync(jid, text);
+                await _messageService.SendTextMessageAsync(jid, wire);
+                _mentions.Clear();
+                _composerHeld = false;
+                if (!string.IsNullOrEmpty(_messageText))
+                {
+                    _mentions.SetText(_messageText);
+                }
+
                 MessageSent?.Invoke(this, EventArgs.Empty);
+                _uiSounds?.PlayMessageSent();
                 LogSend("text-ok", "jid=" + jid);
             }
             catch (UnisonUserException ex)
             {
+                _composerHeld = false;
                 MessageText = text;
                 await PresentUserExceptionAsync(ex, "text-fail");
             }
             catch (Exception ex)
             {
+                _composerHeld = false;
                 MessageText = text;
                 await PresentUserExceptionAsync(
                     new TextSendException("SendText failed: " + ex.Message, ex),
@@ -1908,6 +2652,7 @@ namespace Unison.Core.ViewModels
             }
             finally
             {
+                _composerHeld = false;
                 IsSending = false;
             }
         }
@@ -1917,6 +2662,31 @@ namespace Unison.Core.ViewModels
 
         private Task AttachAudioAsync() =>
             AttachAsync(() => _filePicker.PickChatAudioAsync(), SendPickedAudioAsync, "audio");
+
+        private Task AttachDocumentAsync() =>
+            AttachAsync(() => _filePicker.PickChatDocumentAsync(), SendPickedDocumentAsync, "document");
+
+        /// <summary>
+        /// Feeds a camera JPEG into the same image-send preview used by gallery attach.
+        /// Called by the chat detail view after <see cref="CameraPickViewModel.PhotoCaptured"/>.
+        /// </summary>
+        public Task AcceptCapturedPhotoAsync(byte[] jpegBytes)
+        {
+            if (jpegBytes == null || jpegBytes.Length == 0 || _activeChat == null)
+            {
+                return Task.CompletedTask;
+            }
+
+            return SendPickedImageAsync(
+                _activeChat.JID,
+                new PickedChatMedia
+                {
+                    Bytes = jpegBytes,
+                    MimeType = "image/jpeg",
+                    FileName = "camera.jpg",
+                    IsImage = true
+                });
+        }
 
         /// <summary>
         /// Picks a file of one kind and sends it, with the guards and the failure reporting that
@@ -1975,6 +2745,7 @@ namespace Unison.Core.ViewModels
                     durationSeconds: 0,
                     isVoiceMessage: false);
                 MessageSent?.Invoke(this, EventArgs.Empty);
+                _uiSounds?.PlayMessageSent();
                 LogSend("audio-attach-ok");
             }
             catch (UnisonUserException ex)
@@ -1993,6 +2764,69 @@ namespace Unison.Core.ViewModels
             }
         }
 
+        private async Task SendPickedDocumentAsync(string targetJid, PickedChatMedia picked)
+        {
+            if (!picked.IsDocument)
+            {
+                await PresentUserExceptionAsync(
+                    new AttachmentSendException("Unsupported attachment type."),
+                    "attach-unsupported");
+                return;
+            }
+
+            string info = string.Format(
+                "{0} ({1} KB)",
+                picked.FileName ?? "document",
+                picked.Bytes.Length / 1024);
+            string seedCaption = string.IsNullOrWhiteSpace(MessageText) ? null : MessageText.Trim();
+            ImageSendPreviewResult preview = await _dialogs.ShowDocumentSendPreviewAsync(
+                picked.FileName,
+                info,
+                seedCaption);
+            if (preview == null || !preview.Confirmed || _activeChat == null)
+            {
+                LogSend("document-attach-cancelled");
+                return;
+            }
+
+            string caption = string.IsNullOrWhiteSpace(preview.Caption) ? null : preview.Caption.Trim();
+            IsSending = true;
+            MessageSent?.Invoke(this, EventArgs.Empty);
+            LogSend("document-attach-start", "bytes=" + picked.Bytes.Length);
+            try
+            {
+                await _messageService.SendDocumentAsync(
+                    targetJid,
+                    picked.Bytes,
+                    picked.MimeType,
+                    picked.FileName,
+                    caption);
+                if (!string.IsNullOrWhiteSpace(caption) &&
+                    string.Equals(MessageText?.Trim(), seedCaption, StringComparison.Ordinal))
+                {
+                    MessageText = string.Empty;
+                }
+
+                MessageSent?.Invoke(this, EventArgs.Empty);
+                _uiSounds?.PlayMessageSent();
+                LogSend("document-attach-ok");
+            }
+            catch (UnisonUserException ex)
+            {
+                await PresentUserExceptionAsync(ex, "document-attach-fail");
+            }
+            catch (Exception ex)
+            {
+                await PresentUserExceptionAsync(
+                    new AttachmentSendException("Attach document failed: " + ex.Message, ex),
+                    "document-attach-fail");
+            }
+            finally
+            {
+                IsSending = false;
+            }
+        }
+
         private async Task SendPickedImageAsync(string targetJid, PickedChatMedia picked)
         {
             if (!picked.IsImage)
@@ -2004,26 +2838,31 @@ namespace Unison.Core.ViewModels
             }
 
             string info = string.Format("{0} ({1} KB)", picked.FileName ?? "image", picked.Bytes.Length / 1024);
-            bool confirmed = await _dialogs.ShowImageSendPreviewAsync(picked.Bytes, info);
-            if (!confirmed || _activeChat == null)
+            string seedCaption = string.IsNullOrWhiteSpace(MessageText) ? null : MessageText.Trim();
+            ImageSendPreviewResult preview = await _dialogs.ShowImageSendPreviewAsync(
+                picked.Bytes,
+                info,
+                seedCaption);
+            if (preview == null || !preview.Confirmed || _activeChat == null)
             {
                 LogSend("image-attach-cancelled");
                 return;
             }
 
-            string caption = string.IsNullOrWhiteSpace(MessageText) ? null : MessageText.Trim();
+            string caption = string.IsNullOrWhiteSpace(preview.Caption) ? null : preview.Caption.Trim();
             IsSending = true;
             MessageSent?.Invoke(this, EventArgs.Empty);
             LogSend("image-attach-start", "bytes=" + picked.Bytes.Length);
             try
             {
                 await _messageService.SendImageAsync(targetJid, picked.Bytes, caption);
-                if (caption != null)
+                if (seedCaption != null)
                 {
                     MessageText = string.Empty;
                 }
 
                 MessageSent?.Invoke(this, EventArgs.Empty);
+                _uiSounds?.PlayMessageSent();
                 LogSend("image-attach-ok");
             }
             catch (UnisonUserException ex)
@@ -2042,6 +2881,8 @@ namespace Unison.Core.ViewModels
             }
         }
 
+        private int _recordingCueGeneration;
+
         private async Task StartRecordingAsync()
         {
             if (_activeChat == null || _isSending || _isRecording) return;
@@ -2053,11 +2894,46 @@ namespace Unison.Core.ViewModels
                 MessageText = string.Empty;
             }
 
+            string chatJid = _activeChat.JID;
+            try
+            {
+                if (_audioRecording == null ||
+                    !await _audioRecording.EnsureMicrophoneAccessAsync())
+                {
+                    _uiSounds?.PlayVoiceNoteError();
+                    await ShowSimpleErrorAsync(
+                        "ChatDetail_RecordFailed",
+                        "Could not record audio. Check microphone permission.");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogSendError("record-permission-fail", ex);
+                _uiSounds?.PlayVoiceNoteError();
+                await ShowSimpleErrorAsync(
+                    "ChatDetail_RecordFailed",
+                    "Could not record audio. Check microphone permission.");
+                return;
+            }
+
+            int generation = ++_recordingCueGeneration;
+            _uiSounds?.PlayVoiceNoteStart();
+            await Task.Delay(VoiceNoteCueTiming.StartRecordingDelayMs);
+            if (generation != _recordingCueGeneration ||
+                _isSending ||
+                _isRecording ||
+                _activeChat == null ||
+                !string.Equals(_activeChat.JID, chatJid, StringComparison.Ordinal))
+            {
+                return;
+            }
+
             try
             {
                 LogSend("record-start");
                 _recordingSession = await _audioRecording.StartAsync();
-                _recordingChatJid = _activeChat.JID;
+                _recordingChatJid = chatJid;
                 RecordingElapsedText = "0:00";
                 IsRecording = true;
                 StartElapsedLoop();
@@ -2065,6 +2941,7 @@ namespace Unison.Core.ViewModels
             catch (Exception ex)
             {
                 LogSendError("record-start-fail", ex);
+                _uiSounds?.PlayVoiceNoteError();
                 await CancelRecordingCoreAsync();
                 await ShowSimpleErrorAsync(
                     "ChatDetail_RecordFailed",
@@ -2074,6 +2951,7 @@ namespace Unison.Core.ViewModels
 
         private async Task StopAndSendRecordingAsync()
         {
+            _recordingCueGeneration++;
             var session = _recordingSession ?? _audioRecording.Current;
             string targetJid = _recordingChatJid ?? _activeChat?.JID;
 
@@ -2089,10 +2967,12 @@ namespace Unison.Core.ViewModels
             try
             {
                 recording = await session.StopAsync();
+                _ = PlayStopCueAfterDelayAsync();
             }
             catch (Exception ex)
             {
                 LogSendError("record-stop-fail", ex);
+                _uiSounds?.PlayVoiceNoteError();
                 await CancelRecordingCoreAsync();
                 await ShowSimpleErrorAsync(
                     "ChatDetail_RecordFailed",
@@ -2125,6 +3005,7 @@ namespace Unison.Core.ViewModels
                     recording.DurationSeconds,
                     recording.IsVoiceNote);
                 MessageSent?.Invoke(this, EventArgs.Empty);
+                _uiSounds?.PlayMessageSent();
                 LogSend("voice-send-ok");
             }
             catch (UnisonUserException ex)
@@ -2245,8 +3126,21 @@ namespace Unison.Core.ViewModels
             }
         }
 
+        private async Task PlayStopCueAfterDelayAsync()
+        {
+            int generation = _recordingCueGeneration;
+            await Task.Delay(VoiceNoteCueTiming.StopSoundDelayMs);
+            if (generation != _recordingCueGeneration)
+            {
+                return;
+            }
+
+            _uiSounds?.PlayVoiceNoteStop();
+        }
+
         private async Task CancelRecordingCoreAsync()
         {
+            _recordingCueGeneration++;
             StopElapsedLoop();
 
             var session = _recordingSession ?? _audioRecording?.Current;
@@ -2258,11 +3152,13 @@ namespace Unison.Core.ViewModels
                 if (session != null && session.IsActive)
                 {
                     await session.CancelAsync();
+                    _uiSounds?.PlayVoiceNoteStop();
                 }
             }
             catch (Exception ex)
             {
                 LogSendError("record-cancel", ex);
+                _uiSounds?.PlayVoiceNoteError();
             }
             finally
             {

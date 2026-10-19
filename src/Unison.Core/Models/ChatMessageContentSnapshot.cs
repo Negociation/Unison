@@ -1,11 +1,12 @@
 using System.Collections.Generic;
+using Unison.Core.Helpers;
 
 namespace Unison.Core.Models
 {
     /// <summary>
     /// Transport facts for message facade construction
     /// (<c>IMessageService.GetChatMessage</c> / <c>IChatMessageMapper.MapIndividual</c>).
-    /// Prefer protocol flags; <see cref="Kind"/> is optional — the mapper resolves it when Text.
+    /// Prefer protocol flags; <see cref="Kind"/> is optional — the mapper resolves it when false.
     /// </summary>
     public sealed class ChatMessageContentSnapshot
     {
@@ -27,6 +28,9 @@ namespace Unison.Core.Models
         /// <summary>WhatsApp ContextInfo.StanzaId of the quoted message (when present).</summary>
         public string QuotedMessageId { get; set; }
         public List<string> MentionedJids { get; set; }
+
+        /// <summary>ContextInfo.nonJidMentions.</summary>
+        public bool MentionAll { get; set; }
 
         /// <summary>ContextInfo.isForwarded when the message was forwarded in WhatsApp.</summary>
         public bool IsForwarded { get; set; }

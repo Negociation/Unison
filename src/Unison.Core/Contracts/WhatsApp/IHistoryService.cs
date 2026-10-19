@@ -22,6 +22,34 @@ namespace Unison.Core.Contracts.WhatsApp
         /// </summary>
         event EventHandler<string> SyncStatusChanged;
 
+        /// <summary>True while the saved list snapshot is being read back after launch.</summary>
+        bool IsLoadingPersistedChats { get; }
+
+        /// <summary>
+        /// True while the first sync after login is still arriving in bulk, which is when the list
+        /// has to release rows in batches instead of drawing everything it is handed.
+        /// </summary>
+        bool IsInitialSyncSafeMode { get; }
+
+        /// <summary>
+        /// True until the first sync for this account has landed and gone quiet. Already true
+        /// right after login, before the first chunk arrives; false again only after a reset.
+        /// </summary>
+        bool IsAwaitingFirstHistorySync { get; }
+
+        /// <summary>
+        /// True when startup and sync work should use smaller batches, longer quiet floors and
+        /// gentler list updates. Driven by memory pressure and how hot the sync is, not by
+        /// form factor alone.
+        /// </summary>
+        bool PreferFrugalSyncBudget { get; }
+
+        /// <summary>How many conversations of the first sync are in, for the progress line.</summary>
+        int InitialSyncProcessedConversations { get; }
+
+        /// <summary>How many the first sync said there would be. Zero until it says.</summary>
+        int InitialSyncTotalConversations { get; }
+
         /// <summary>
         /// A chunk of history was applied. Null payload means "something changed, reload" -
         /// which is all any listener does with it anyway.
@@ -74,5 +102,12 @@ namespace Unison.Core.Contracts.WhatsApp
         /// stays linked; only what we hold locally is thrown away.
         /// </summary>
         Task ResyncConversationsAsync(IProgress<ConversationResyncPhase> progress = null);
+
+        /// <summary>
+        /// Asks the phone for a FULL_HISTORY_SYNC_ON_DEMAND lot without wiping local data.
+        /// Debug / catch-up repair. When <paramref name="force"/> is true, clears a stuck
+        /// in-flight gate so another request can go out.
+        /// </summary>
+        Task<bool> RequestFullHistoryOnDemandAsync(string reason = null, bool force = false);
     }
 }

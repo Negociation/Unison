@@ -19,9 +19,17 @@ namespace Unison.Core.State
     {
         private readonly IChatStateStore _chatState;
         private readonly IPersonStore _personStore;
-        private readonly IWhatsAppService _whatsApp;
+        private readonly IJidResolver _jids;
         private readonly IStringResources _strings;
         private readonly IDispatcher _dispatcher;
+        private readonly IChatService _chats;
+
+        /// <summary>
+        /// Same sources, same order the timeline bubbles use. The strip resolving a sender through
+        /// a shorter list than the bubble is what let an open group show the name above the message
+        /// and the JID in the list at the same time.
+        /// </summary>
+        private readonly ParticipantResolutionContext _participants;
 
         private readonly object _gate = new object();
 
@@ -39,15 +47,19 @@ namespace Unison.Core.State
         public ChatAuthorProjection(
             IChatStateStore chatState,
             IPersonStore personStore,
-            IWhatsAppService whatsApp,
+            IJidResolver jids,
             IStringResources strings,
-            IDispatcher dispatcher)
+            IDispatcher dispatcher,
+            IContactService contacts = null,
+            IChatService chats = null)
         {
             _chatState = chatState ?? throw new ArgumentNullException(nameof(chatState));
             _personStore = personStore ?? throw new ArgumentNullException(nameof(personStore));
-            _whatsApp = whatsApp;
+            _jids = jids ?? throw new ArgumentNullException(nameof(jids));
             _strings = strings;
             _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+            _chats = chats;
+            _participants = new ParticipantResolutionContext(jids, contacts, chatState, personStore);
         }
 
         public void Start()
@@ -64,14 +76,40 @@ namespace Unison.Core.State
 
             _personStore.PersonChanged += OnPersonChanged;
             _chatState.DisplayNamesChanged += OnDisplayNamesChanged;
+            _chatState.GroupRosterChanged += OnGroupRosterChanged;
             _chatState.Chats.CollectionChanged += OnChatsChanged;
 
             ScheduleSweep();
         }
 
+        public void Refresh() => ScheduleSweep();
+
         private void OnPersonChanged(object sender, string jid) => ScheduleSweep();
 
         private void OnDisplayNamesChanged(object sender, EventArgs e) => ScheduleSweep();
+
+        /// <summary>
+        /// One signal per roster apply, not one per member: a group metadata reply merges names onto
+        /// every <see cref="GroupMember"/>, and subscribing to those would be N handlers and N
+        /// sweeps for one answer. <see cref="ScheduleSweep"/> collapses whatever arrives into one
+        /// pass per UI turn.
+        /// </summary>
+        private void OnGroupRosterChanged(object sender, string groupJid)
+        {
+            // The roster brings LID↔PN pairs with it, so a store lookup that missed before this
+            // group was known can now hit under the phone JID. Only this row's sender is retried;
+            // clearing the whole set would re-read SQLite for every group during a sync burst.
+            string participant = _chatState.FindChat(groupJid)?.LastMessageParticipantJid;
+            if (!string.IsNullOrWhiteSpace(participant))
+            {
+                lock (_gate)
+                {
+                    _warmAttempted.Remove(participant);
+                }
+            }
+
+            ScheduleSweep();
+        }
 
         private void OnChatsChanged(object sender, NotifyCollectionChangedEventArgs e)
         {
@@ -117,6 +155,7 @@ namespace Unison.Core.State
                 : "You";
 
             List<string> needsStoreLookup = null;
+            List<ChatItem> dirtyStrips = null;
 
             foreach (var chat in _chatState.Chats)
             {
@@ -131,44 +170,109 @@ namespace Unison.Core.State
                     continue;
                 }
 
-                string resolved = ResolveParticipantDisplayName(participant);
-                if (string.IsNullOrWhiteSpace(resolved))
+                string beforeAuthor = chat.LastMessageAuthor;
+                string beforeSender = chat.LastMessageSenderName;
+
+                // A strip poisoned with the group subject must not count as a real name —
+                // otherwise Decide keeps it forever.
+                if (!string.IsNullOrWhiteSpace(chat.Name) &&
+                    !string.IsNullOrWhiteSpace(chat.LastMessageSenderName) &&
+                    string.Equals(
+                        chat.LastMessageSenderName.Trim(),
+                        chat.Name.Trim(),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    chat.LastMessageSenderName = null;
+                    if (!string.IsNullOrEmpty(chat.LastMessageAuthor) &&
+                        chat.LastMessageAuthor.StartsWith(
+                            chat.Name.Trim(),
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        chat.LastMessageAuthor = string.Empty;
+                    }
+                }
+
+                string resolved = ResolveParticipantDisplayName(chat, participant);
+                if (resolved == null && MarkForWarmUp(participant))
                 {
                     // Nothing in memory. The name may still be on disk from an earlier session.
-                    if (MarkForWarmUp(participant))
-                    {
-                        (needsStoreLookup ?? (needsStoreLookup = new List<string>())).Add(participant);
-                    }
-
-                    continue;
+                    (needsStoreLookup ?? (needsStoreLookup = new List<string>())).Add(participant);
                 }
 
-                if (string.Equals(resolved, chat.LastMessageSenderName, StringComparison.Ordinal))
+                string canonical = _jids.GetCanonicalJid(participant);
+                string number = ParticipantStripLabel.ForParticipant(participant, canonical);
+
+                switch (ChatAuthorStripDecision.Decide(
+                    chat.LastMessageSenderName,
+                    IsUsableParticipantLabel(chat.LastMessageSenderName, participant),
+                    resolved,
+                    resolved != null,
+                    !string.IsNullOrEmpty(number)))
                 {
-                    continue;
+                    case ChatAuthorStripAction.ShowName:
+                        ApplyStrip(chat, participant, canonical, resolved, selfLabel);
+                        break;
+
+                    case ChatAuthorStripAction.ShowNumber:
+                        // The number goes in the strip but not in the sender-name slot: it is a
+                        // stand-in, and leaving that slot empty keeps the next sweep looking.
+                        ApplyStrip(chat, participant, canonical, null, selfLabel);
+                        break;
                 }
 
-                string prefix = ChatPreviewNormalizer.FormatListAuthorPrefix(
-                    new ChatMessage
-                    {
-                        IsFromMe = false,
-                        SenderName = resolved,
-                        ParticipantJid = participant
-                    },
-                    true,
-                    selfLabel);
-
-                if (!string.IsNullOrEmpty(prefix))
+                if (!string.Equals(beforeAuthor, chat.LastMessageAuthor, StringComparison.Ordinal) ||
+                    !string.Equals(beforeSender, chat.LastMessageSenderName, StringComparison.Ordinal))
                 {
-                    chat.LastMessageSenderName = resolved;
-                    chat.LastMessageAuthor = prefix;
+                    (dirtyStrips ?? (dirtyStrips = new List<ChatItem>())).Add(chat);
                 }
+            }
+
+            if (dirtyStrips != null && _chats != null)
+            {
+                // Without this the next cold start reloads an empty author (ComposeAuthor had
+                // nothing usable from LID + no sender name) and the strip goes blank again.
+                _chats.PersistChatListRows(dirtyStrips);
             }
 
             if (needsStoreLookup != null)
             {
                 _ = WarmFromStoreAsync(needsStoreLookup);
             }
+        }
+
+        /// <summary>
+        /// Writes the strip for one row. <paramref name="resolvedName"/> null means "no name known":
+        /// the prefix falls back to the sender's number and the row's name slot is left empty.
+        /// </summary>
+        private void ApplyStrip(
+            ChatItem chat,
+            string participantJid,
+            string canonicalJid,
+            string resolvedName,
+            string selfLabel)
+        {
+            string prefix = ChatPreviewNormalizer.FormatListAuthorPrefix(
+                new ChatMessage
+                {
+                    IsFromMe = false,
+                    SenderName = resolvedName,
+                    ParticipantJid = participantJid
+                },
+                true,
+                selfLabel,
+                canonicalJid);
+
+            if (string.IsNullOrEmpty(prefix))
+            {
+                return;
+            }
+
+            if (resolvedName != null)
+            {
+                chat.LastMessageSenderName = resolvedName;
+            }
+
+            chat.LastMessageAuthor = prefix;
         }
 
         private bool MarkForWarmUp(string participantJid)
@@ -200,7 +304,7 @@ namespace Unison.Core.State
                         continue;
                     }
 
-                    string canonical = _whatsApp?.GetCanonicalJid(jid);
+                    string canonical = _jids?.GetCanonicalJid(jid);
                     if (string.IsNullOrWhiteSpace(canonical) ||
                         string.Equals(canonical, jid, StringComparison.OrdinalIgnoreCase))
                     {
@@ -226,71 +330,53 @@ namespace Unison.Core.State
         }
 
         /// <summary>
-        /// Best label for a participant across the JID's own and canonical (LID → PN) forms.
-        /// Null when nothing better than the raw JID is known yet.
+        /// Best label for the sender, through the same chain the timeline bubbles use: the group
+        /// roster, the account's name caches, the Person table, then the 1:1 chat. Null when
+        /// nothing better than a bare JID/number is known yet. No disk I/O — runs per list row.
         /// </summary>
-        private string ResolveParticipantDisplayName(string participantJid)
+        private string ResolveParticipantDisplayName(ChatItem groupChat, string participantJid)
         {
-            string name = ResolveNameForJid(participantJid);
-            if (!string.IsNullOrWhiteSpace(name))
+            string resolved = GroupParticipantResolver.ResolveDisplayName(
+                participantJid,
+                groupChat,
+                _participants);
+
+            if (!IsUsableParticipantLabel(resolved, participantJid))
             {
-                return name;
+                return null;
             }
 
-            string canonical = _whatsApp?.GetCanonicalJid(participantJid);
-            if (!string.IsNullOrWhiteSpace(canonical) &&
-                !string.Equals(canonical, participantJid, StringComparison.OrdinalIgnoreCase))
+            // Never put the group subject in the author strip — that is what the old
+            // chatResolvedName fallback did when the envelope omitted participant.
+            if (!string.IsNullOrWhiteSpace(groupChat?.Name) &&
+                string.Equals(resolved.Trim(), groupChat.Name.Trim(), StringComparison.OrdinalIgnoreCase))
             {
-                name = ResolveNameForJid(canonical);
-                if (!string.IsNullOrWhiteSpace(name))
-                {
-                    return name;
-                }
+                return null;
             }
 
-            return null;
+            return resolved.Trim();
         }
 
         /// <summary>
-        /// One JID, every in-memory source: resolved-name map, the Person cache the roster writes
-        /// into, then the 1:1 chat with that person. No disk I/O — runs per list row.
+        /// Real display name only — not empty, not a raw JID/user part, not a phone-like digit string.
+        /// Phone vs LID bare used to look "usable" and then blocked upgrades to the real name.
         /// </summary>
-        private string ResolveNameForJid(string jid)
+        private bool IsUsableParticipantLabel(string candidate, string jid)
         {
-            string name = _chatState.ResolveDisplayName(jid);
-            if (IsUsableParticipantLabel(name, jid))
-            {
-                return name;
-            }
-
-            Person person = _personStore?.TryGetCached(jid);
-            if (person != null && IsUsableParticipantLabel(person.Name, jid))
-            {
-                return person.Name;
-            }
-
-            ChatItem direct = _chatState.FindChat(jid);
-            if (direct != null && IsUsableParticipantLabel(direct.Name, jid))
-            {
-                return direct.Name;
-            }
-
-            return null;
-        }
-
-        /// <summary>
-        /// A label equal to the JID's own digits is not a name — using it would just re-print the
-        /// LID we are trying to replace.
-        /// </summary>
-        private static bool IsUsableParticipantLabel(string candidate, string jid)
-        {
-            if (string.IsNullOrWhiteSpace(candidate))
+            if (!GroupParticipantResolver.IsUsableDisplayLabel(candidate, jid))
             {
                 return false;
             }
 
-            string bare = (jid ?? string.Empty).Split('@')[0].Split(':')[0];
-            return !string.Equals(candidate.Trim(), bare, StringComparison.OrdinalIgnoreCase);
+            string canonical = _jids?.GetCanonicalJid(jid);
+            if (!string.IsNullOrWhiteSpace(canonical) &&
+                !string.Equals(canonical, jid, StringComparison.OrdinalIgnoreCase) &&
+                !GroupParticipantResolver.IsUsableDisplayLabel(candidate, canonical))
+            {
+                return false;
+            }
+
+            return true;
         }
     }
 }

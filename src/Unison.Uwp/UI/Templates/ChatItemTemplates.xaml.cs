@@ -3,7 +3,6 @@ using Unison.Core.Contracts;
 using Unison.Core.Contracts.WhatsApp;
 using Unison.Core.Helpers;
 using Unison.Core.Models;
-using Unison.Uwp.Helpers;
 using Unison.Uwp.UI.Views;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
@@ -67,47 +66,28 @@ namespace Unison.Uwp.UI.Templates
 
                 if (string.Equals(tag, "chatPin", StringComparison.Ordinal) && menuItem != null)
                 {
-                    menuItem.Text = chat.IsChatPinned
-                        ? LocalizedStrings.Get("ChatList_UnpinChat.Text", "Unpin chat")
-                        : LocalizedStrings.Get("ChatList_PinChat.Text", "Pin chat");
-                    menuItem.Visibility = Visibility.Visible;
+                    menuItem.Visibility = chat.IsChatPinned ? Visibility.Collapsed : Visibility.Visible;
+                }
+                else if (string.Equals(tag, "chatUnpin", StringComparison.Ordinal) && menuItem != null)
+                {
+                    menuItem.Visibility = chat.IsChatPinned ? Visibility.Visible : Visibility.Collapsed;
                 }
                 else if (string.Equals(tag, "widgetPin", StringComparison.Ordinal) && menuItem != null)
                 {
-                    menuItem.Text = chat.IsWidgetPinned
-                        ? LocalizedStrings.Get("ChatDetail_UnpinFromStart.Text", "Unpin from Start")
-                        : LocalizedStrings.Get("ChatDetail_PinToStart.Text", "Pin to Start");
-                    menuItem.Visibility = Visibility.Visible;
+                    menuItem.Visibility = chat.IsWidgetPinned ? Visibility.Collapsed : Visibility.Visible;
+                }
+                else if (string.Equals(tag, "widgetUnpin", StringComparison.Ordinal) && menuItem != null)
+                {
+                    menuItem.Visibility = chat.IsWidgetPinned ? Visibility.Visible : Visibility.Collapsed;
                 }
                 else if (string.Equals(tag, "localMuteSub", StringComparison.Ordinal) && subItem != null)
                 {
-                    // Desmutado → submenu "Silenciar notificações"; mutado → esconde.
                     subItem.Visibility = muted ? Visibility.Collapsed : Visibility.Visible;
-                    subItem.Text = LocalizedStrings.Get("ChatDetail_MuteNotifications.Text", "Mute notifications");
                     subItem.Foreground = new SolidColorBrush(Windows.UI.Colors.White);
-                    foreach (var child in subItem.Items)
-                    {
-                        var duration = child as MenuFlyoutItem;
-                        string durationTag = duration?.Tag as string;
-                        if (string.Equals(durationTag, "mute8h", StringComparison.Ordinal))
-                        {
-                            duration.Text = LocalizedStrings.Get("ChatDetail_MuteFor8Hours.Text", "8 hours");
-                        }
-                        else if (string.Equals(durationTag, "mute1w", StringComparison.Ordinal))
-                        {
-                            duration.Text = LocalizedStrings.Get("ChatDetail_MuteFor1Week.Text", "1 week");
-                        }
-                        else if (string.Equals(durationTag, "muteForever", StringComparison.Ordinal))
-                        {
-                            duration.Text = LocalizedStrings.Get("ChatDetail_MuteForever.Text", "Always");
-                        }
-                    }
                 }
                 else if (string.Equals(tag, "unmute", StringComparison.Ordinal) && menuItem != null)
                 {
-                    // Mutado → "Ativar notificações"; desmutado → esconde.
                     menuItem.Visibility = muted ? Visibility.Visible : Visibility.Collapsed;
-                    menuItem.Text = LocalizedStrings.Get("ChatDetail_UnmuteNotifications.Text", "Unmute notifications");
                 }
                 else if (string.Equals(tag, "addContact", StringComparison.Ordinal) && menuItem != null)
                 {
@@ -121,7 +101,18 @@ namespace Unison.Uwp.UI.Templates
                     }
 
                     menuItem.Visibility = canAdd ? Visibility.Visible : Visibility.Collapsed;
-                    menuItem.Text = LocalizedStrings.Get("ChatDetail_AddContact.Text", "Add contact");
+                }
+                else if (string.Equals(tag, "archiveChat", StringComparison.Ordinal) && menuItem != null)
+                {
+                    menuItem.Visibility = chat.Status == ChatStatus.Active
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
+                }
+                else if (string.Equals(tag, "unarchiveChat", StringComparison.Ordinal) && menuItem != null)
+                {
+                    menuItem.Visibility = chat.Status == ChatStatus.Archived
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
                 }
             }
         }
@@ -212,6 +203,27 @@ namespace Unison.Uwp.UI.Templates
             FindChatList(sender)?.SetLocalMute(chat, null);
         }
 
+        private void DeleteChat_Click(object sender, RoutedEventArgs e)
+        {
+            var chat = ResolveChat(sender as FrameworkElement);
+            if (chat != null)
+            {
+                FindChatList(sender)?.DeleteChat(chat);
+            }
+        }
+
+        private void ArchiveChat_Click(object sender, RoutedEventArgs e)
+        {
+            var chat = ResolveChat(sender as FrameworkElement);
+            FindChatList(sender)?.ArchiveChat(chat);
+        }
+
+        private void UnarchiveChat_Click(object sender, RoutedEventArgs e)
+        {
+            var chat = ResolveChat(sender as FrameworkElement);
+            FindChatList(sender)?.UnarchiveChat(chat);
+        }
+
         private static ChatItem ResolveChat(FrameworkElement element)
         {
             var chat = element?.DataContext as ChatItem;
@@ -264,7 +276,7 @@ namespace Unison.Uwp.UI.Templates
         /// <summary>
         /// ContextFlyout content lives in a popup; walk <see cref="FlyoutBase.Target"/> (Imgur-style), then UI root.
         /// </summary>
-        private static ChatListView FindChatList(object sender)
+        private static IChatRowActions FindChatList(object sender)
         {
             var flyoutItem = sender as MenuFlyoutItem;
             if (flyoutItem != null)
@@ -275,7 +287,7 @@ namespace Unison.Uwp.UI.Templates
                     var flyout = current as MenuFlyout;
                     if (flyout?.Target != null)
                     {
-                        var fromTarget = FindAncestor<ChatListView>(flyout.Target);
+                        var fromTarget = FindAncestor<IChatRowActions>(flyout.Target);
                         if (fromTarget != null)
                         {
                             return fromTarget;
@@ -299,13 +311,13 @@ namespace Unison.Uwp.UI.Templates
                 }
             }
 
-            var fromSender = FindAncestor<ChatListView>(sender as DependencyObject);
+            var fromSender = FindAncestor<IChatRowActions>(sender as DependencyObject);
             if (fromSender != null)
             {
                 return fromSender;
             }
 
-            return FindInSubtree<ChatListView>(Window.Current?.Content as DependencyObject);
+            return FindInSubtree<IChatRowActions>(Window.Current?.Content as DependencyObject);
         }
 
         private static T FindAncestor<T>(DependencyObject start) where T : class

@@ -6,7 +6,7 @@ using Unison.Core.Helpers;
 
 namespace Unison.Core.Models
 {
-    public class ChatItem : INotifyPropertyChanged
+    public class ChatItem : INotifyPropertyChanged, IAvatarSubject
     {
         public event PropertyChangedEventHandler PropertyChanged;
 
@@ -177,8 +177,9 @@ namespace Unison.Core.Models
         public bool HasUnread => _unreadCount > 0;
 
         /// <summary>
-        /// Favourite chats. Always false until favourites are persisted; the list filter still
-        /// consults this so the UI can ship before the feature does.
+        /// WhatsApp Favourites list (app-state <c>favoritesAction</c> / label list FAVORITES).
+        /// Separate from chat-list pin (<see cref="IsChatPinned"/>). Stub until that store exists —
+        /// the Favorites filter stays empty on purpose.
         /// </summary>
         public bool IsFavorite => false;
 
@@ -396,11 +397,42 @@ namespace Unison.Core.Models
             }
         }
 
-        private bool _isArchived;
+        private ChatStatus _status = ChatStatus.Active;
+
+        /// <summary>SQLite-backed conversation lifecycle.</summary>
+        public ChatStatus Status
+        {
+            get => _status;
+            set
+            {
+                if (_status == value) return;
+                bool wasArchived = _status == ChatStatus.Archived;
+                _status = value;
+                OnPropertyChanged();
+                if (wasArchived != (_status == ChatStatus.Archived))
+                {
+                    OnPropertyChanged(nameof(IsArchived));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Compatibility projection for app-state/archive payloads and legacy snapshots.
+        /// </summary>
         public bool IsArchived
         {
-            get => _isArchived;
-            set { _isArchived = value; OnPropertyChanged(); }
+            get => Status == ChatStatus.Archived;
+            set
+            {
+                if (value)
+                {
+                    Status = ChatStatus.Archived;
+                }
+                else if (Status == ChatStatus.Archived)
+                {
+                    Status = ChatStatus.Active;
+                }
+            }
         }
 
         private bool _isChatPinned;
@@ -409,18 +441,10 @@ namespace Unison.Core.Models
         public bool IsChatPinned
         {
             get => _isChatPinned;
-            set { _isChatPinned = value; OnPropertyChanged(); }
-        }
-
-        private ChatLocalStatus _localStatus = ChatLocalStatus.Active;
-        /// <summary>SQLite local lifecycle (Active / Deleted / Ignored). Mute uses <see cref="MutedUntil"/>.</summary>
-        public ChatLocalStatus LocalStatus
-        {
-            get => _localStatus;
             set
             {
-                if (_localStatus == value) return;
-                _localStatus = value;
+                if (_isChatPinned == value) return;
+                _isChatPinned = value;
                 OnPropertyChanged();
             }
         }
@@ -442,7 +466,12 @@ namespace Unison.Core.Models
         public long? PinnedTimestamp
         {
             get => _pinnedTimestamp;
-            set { _pinnedTimestamp = value; OnPropertyChanged(); }
+            set
+            {
+                if (_pinnedTimestamp == value) return;
+                _pinnedTimestamp = value;
+                OnPropertyChanged();
+            }
         }
 
         private long? _mutedUntil;

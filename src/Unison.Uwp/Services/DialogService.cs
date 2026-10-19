@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using Microsoft.Extensions.DependencyInjection;
 using Unison.Core.Contracts;
+using Unison.Core.Models;
 using Unison.Core.ViewModels;
 using Unison.Uwp.Helpers;
 using Unison.Uwp.UI.Dialogs;
@@ -170,26 +171,101 @@ namespace Unison.Uwp.Services
             return null;
         }
 
-        public async Task<bool> ShowImageSendPreviewAsync(byte[] imageBytes, string infoText)
+        public async Task<ImageSendPreviewResult> ShowImageSendPreviewAsync(
+            byte[] imageBytes,
+            string infoText,
+            string initialCaption = null)
         {
+            var cancelled = new ImageSendPreviewResult { Confirmed = false };
             try
             {
                 var dialog = new ImageSendPreviewDialog();
-                await dialog.SetPreviewAsync(imageBytes, infoText);
+                await dialog.SetPreviewAsync(imageBytes, infoText, initialCaption);
                 var result = await dialog.ShowAsync();
-                return result == ContentDialogResult.Primary;
+                if (result != ContentDialogResult.Primary)
+                {
+                    return cancelled;
+                }
+
+                return new ImageSendPreviewResult
+                {
+                    Confirmed = true,
+                    Caption = dialog.Caption
+                };
             }
             catch (System.Runtime.InteropServices.COMException ex)
                 when (ex.Message.Contains("single ContentDialog") ||
                       ex.HResult == unchecked((int)0x80070057))
             {
                 System.Diagnostics.Debug.WriteLine("[DialogService] Another dialog is already open (image preview).");
-                return false;
+                return cancelled;
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine("[DialogService] ShowImageSendPreviewAsync: " + ex.Message);
-                return false;
+                return cancelled;
+            }
+        }
+
+        public async Task<ImageSendPreviewResult> ShowDocumentSendPreviewAsync(
+            string fileName,
+            string infoText,
+            string initialCaption = null)
+        {
+            var cancelled = new ImageSendPreviewResult { Confirmed = false };
+            try
+            {
+                var dialog = new DocumentSendPreviewDialog();
+                dialog.SetPreview(fileName, infoText, initialCaption);
+                var result = await dialog.ShowAsync();
+                if (result != ContentDialogResult.Primary)
+                {
+                    return cancelled;
+                }
+
+                return new ImageSendPreviewResult
+                {
+                    Confirmed = true,
+                    Caption = dialog.Caption
+                };
+            }
+            catch (System.Runtime.InteropServices.COMException ex)
+                when (ex.Message.Contains("single ContentDialog") ||
+                      ex.HResult == unchecked((int)0x80070057))
+            {
+                System.Diagnostics.Debug.WriteLine("[DialogService] Another dialog is already open (document preview).");
+                return cancelled;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[DialogService] ShowDocumentSendPreviewAsync: " + ex.Message);
+                return cancelled;
+            }
+        }
+
+        public async Task ShowWhatsAppSettingsAsync(SettingsViewModel settingsVm, bool openProfile = false)
+        {
+            if (settingsVm == null)
+            {
+                throw new ArgumentNullException(nameof(settingsVm));
+            }
+
+            try
+            {
+                var dialog = new Unison.Uwp.Shell.WhatsApp.Dialogs.SettingsDialog();
+                dialog.Bind(settingsVm);
+                dialog.OpenOnProfile = openProfile;
+                await dialog.ShowAsync();
+            }
+            catch (System.Runtime.InteropServices.COMException ex)
+                when (ex.Message.Contains("single ContentDialog") ||
+                      ex.HResult == unchecked((int)0x80070057))
+            {
+                System.Diagnostics.Debug.WriteLine("[DialogService] Another dialog is already open (WhatsApp settings).");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[DialogService] ShowWhatsAppSettingsAsync: " + ex.Message);
             }
         }
 
@@ -221,7 +297,73 @@ namespace Unison.Uwp.Services
             }
         }
 
-        public async Task ShowQrFullscreenAsync(string qrData)
+        public async Task ShowRuntimeDiagnosticsAsync()
+        {
+            try
+            {
+                var dialog = new RuntimeDiagnosticsDialog();
+                await dialog.ShowAsync();
+            }
+            catch (System.Runtime.InteropServices.COMException ex)
+                when (ex.Message.Contains("single ContentDialog") ||
+                      ex.HResult == unchecked((int)0x80070057))
+            {
+                System.Diagnostics.Debug.WriteLine("[DialogService] Another dialog is already open (runtime diagnostics).");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[DialogService] ShowRuntimeDiagnosticsAsync: " + ex.Message);
+            }
+        }
+
+        public async Task<StartTileSelection> ShowStartTileMarkAsync(StartTileMark current, bool transparent)
+        {
+            try
+            {
+                var dialog = new StartTileMarkDialog();
+                dialog.Bind(current, transparent);
+                ContentDialogResult result = await dialog.ShowAsync();
+                if (result != ContentDialogResult.Primary)
+                {
+                    return null;
+                }
+
+                return new StartTileSelection
+                {
+                    Mark = dialog.Result,
+                    Transparent = dialog.UseTransparentPlate
+                };
+            }
+            catch (System.Runtime.InteropServices.COMException ex)
+                when (ex.Message.Contains("single ContentDialog") ||
+                      ex.HResult == unchecked((int)0x80070057))
+            {
+                System.Diagnostics.Debug.WriteLine("[DialogService] Another dialog is already open (start tile).");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[DialogService] ShowStartTileMarkAsync: " + ex.Message);
+                return null;
+            }
+        }
+
+        public Task ShowQrFullscreenAsync(LoginViewModel loginVm)
+        {
+            if (loginVm == null || string.IsNullOrEmpty(loginVm.QRData))
+            {
+                return Task.CompletedTask;
+            }
+
+            return ShowQrFullscreenCoreAsync(loginVm.QRData, loginVm);
+        }
+
+        public Task ShowQrFullscreenAsync(string qrData)
+        {
+            return ShowQrFullscreenCoreAsync(qrData, loginVm: null);
+        }
+
+        private async Task ShowQrFullscreenCoreAsync(string qrData, LoginViewModel loginVm)
         {
             if (string.IsNullOrEmpty(qrData))
             {
@@ -231,7 +373,16 @@ namespace Unison.Uwp.Services
             try
             {
                 var dialog = new QrCodeFullscreenDialog();
-                dialog.SetQrPayload(qrData);
+                if (loginVm != null)
+                {
+                    // Same LoginViewModel as the pairing surface (Imgur-style target).
+                    dialog.DataContext = loginVm;
+                }
+                else
+                {
+                    dialog.SetQrPayload(qrData);
+                }
+
                 await dialog.ShowAsync();
             }
             catch (System.Runtime.InteropServices.COMException ex)

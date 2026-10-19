@@ -16,6 +16,7 @@ using System.Threading.Tasks;
 using Unison.Core.Contracts;
 using Unison.Core.Contracts.WhatsApp;
 using Unison.Core.Models;
+using Unison.Core.State;
 using Unison.Socket.UseCases.Profile;
 using Unison.Uwp.Services.Socket;
 
@@ -24,29 +25,34 @@ namespace Unison.Uwp.Services.WhatsApp.Profiles
     public sealed class ProfileFacade : IProfileService
     {
         private readonly IWhatsAppSessionProvider _sessions;
-        private readonly IWhatsAppService _appState;
+        private readonly IWhatsAppService _connection;
+        private readonly SelfProfileState _self;
+        private readonly IAvatarCache _avatarCache;
 
-        /// <param name="appState">
-        /// Still the owner of the cached avatar and the persisted profile. That half moves to
-        /// the state store in a later phase; this facade only replaces the wire path.
-        /// </param>
-        internal ProfileFacade(IWhatsAppSessionProvider sessions, IWhatsAppService appState)
+        /// <param name="connection">Only for reconnecting and for knowing when a session opened.</param>
+        internal ProfileFacade(
+            IWhatsAppSessionProvider sessions,
+            IWhatsAppService connection,
+            SelfProfileState self,
+            IAvatarCache avatarCache)
         {
             if (sessions == null)
             {
                 throw new ArgumentNullException(nameof(sessions));
             }
 
-            if (appState == null)
+            if (connection == null)
             {
-                throw new ArgumentNullException(nameof(appState));
+                throw new ArgumentNullException(nameof(connection));
             }
 
             _sessions = sessions;
-            _appState = appState;
+            _connection = connection;
+            _self = self ?? throw new ArgumentNullException(nameof(self));
+            _avatarCache = avatarCache ?? throw new ArgumentNullException(nameof(avatarCache));
 
             // Both live as long as the app does, so there is nothing to unhook from.
-            _appState.OnUserProfileChanged += (s, e) =>
+            _self.Changed += (s, e) =>
             {
                 try
                 {
@@ -62,7 +68,7 @@ namespace Unison.Uwp.Services.WhatsApp.Profiles
             // sent then is answered by nobody. This is the second chance: once the session is
             // actually up, ask again. Without it a cold start keeps showing whatever avatar was
             // cached on the previous run, or none at all on a fresh install.
-            _appState.OnSessionInitialized += (s, e) => { _ = ResyncQuietlyAsync(); };
+            _connection.OnSessionInitialized += (s, e) => { _ = ResyncQuietlyAsync(); };
         }
 
         private async Task ResyncQuietlyAsync()
@@ -81,12 +87,7 @@ namespace Unison.Uwp.Services.WhatsApp.Profiles
 
         public Profile GetCurrentProfile()
         {
-            var profile = _appState.CurrentProfile;
-            if (profile == null)
-            {
-                return new Profile();
-            }
-
+            var profile = _self.Snapshot();
             return new Profile
             {
                 Id = profile.Id,
@@ -99,7 +100,7 @@ namespace Unison.Uwp.Services.WhatsApp.Profiles
 
         public async Task SyncCurrentProfileAsync(CancellationToken cancellationToken = default(CancellationToken))
         {
-            var meId = _appState.CurrentProfile != null ? _appState.CurrentProfile.Id : null;
+            var meId = _self.Snapshot().Id;
             if (string.IsNullOrWhiteSpace(meId))
             {
                 Debug.WriteLine("[ProfileFacade] Sync skipped: own JID unknown");
@@ -110,11 +111,11 @@ namespace Unison.Uwp.Services.WhatsApp.Profiles
             // the socket is usually still handshaking when we get here. Giving up at that point
             // is why an updated avatar never arrived: nothing asks again once the session opens,
             // so the app kept showing whatever was cached from the last run.
-            if (!_appState.IsTransportReady)
+            if (!_sessions.IsTransportReady)
             {
                 try
                 {
-                    await _appState.EnsureConnectedAsync().ConfigureAwait(false);
+                    await _connection.EnsureConnectedAsync().ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -168,7 +169,8 @@ namespace Unison.Uwp.Services.WhatsApp.Profiles
             string localUri = null;
             try
             {
-                localUri = await _appState.CacheRemoteAvatarAsync(meId, remoteUrl, cancellationToken)
+                localUri = await _avatarCache
+                    .SaveAsync(meId, remoteUrl, AvatarVariant.Preview, cancellationToken)
                     .ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -178,23 +180,20 @@ namespace Unison.Uwp.Services.WhatsApp.Profiles
             }
 
             var next = !string.IsNullOrWhiteSpace(localUri) ? localUri : remoteUrl;
-            if (!string.Equals(_appState.CurrentUserAvatar, next, StringComparison.Ordinal))
-            {
-                _appState.CurrentUserAvatar = next;
-            }
+            _self.AvatarUrl = next;
         }
 
         private void ApplyNameIfMissing()
         {
-            if (!string.IsNullOrWhiteSpace(_appState.CurrentUserName))
+            if (!string.IsNullOrWhiteSpace(_self.Name))
             {
                 return;
             }
 
-            var name = ResolveDisplayName(_appState.CurrentProfile);
+            var name = ResolveDisplayName(_self.Snapshot());
             if (!string.IsNullOrWhiteSpace(name))
             {
-                _appState.CurrentUserName = name;
+                _self.Name = name;
             }
         }
 

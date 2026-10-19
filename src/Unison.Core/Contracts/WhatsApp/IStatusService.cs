@@ -27,7 +27,9 @@ namespace Unison.Core.Contracts.WhatsApp
         /// </summary>
         Task<string> EnsureMediaAsync(HistoryStatus status);
 
-        /// <summary>Upserts a live Status item (not a chat). Returns false when skipped.</summary>
-        Task<bool> TryIngestLiveAsync(HistoryStatus item);
+        /// <summary>
+        /// Records that this Status item was shown in the viewer (local <see cref="StatusViewState"/>).
+        /// </summary>
+        Task MarkViewedAsync(string authorJid, string messageId);
     }
 }

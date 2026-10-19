@@ -47,11 +47,11 @@
                 <Image
                     Grid.Row="0"
                     Grid.Column="0"
-                    Width="100"
-                    Height="100"
-                    Margin="-20,-25,-10,0"
+                    Width="44"
+                    Height="44"
+                    Margin="0,2,10,0"
                     VerticalAlignment="Top"
-                    Source="ms-appx:///Assets/Square150x150Logo.png"
+                    Source="ms-appx:///Assets/StoreLogo.png"
                     Stretch="Uniform" />
 
                 <StackPanel
@@ -65,10 +65,11 @@
                         Text="{x:Bind ViewModel.AppTitle, Mode=OneWay}"
                         TextWrapping="Wrap" />
                     <TextBlock
+                        x:Uid="Settings_AppDescription"
                         Margin="0,2,0,0"
                         FontSize="12"
                         Foreground="{ThemeResource WhatsAppTextMediumBrush}"
-                        Text="{x:Bind ViewModel.AppDescription, Mode=OneWay}"
+                        Text="WhatsApp Client based on Baileys for Windows Universal Platform."
                         TextWrapping="Wrap" />
                 </StackPanel>
 
@@ -105,11 +106,12 @@
                         Foreground="{ThemeResource WhatsAppTextHighBrush}"
                         Text="Branch" />
                     <TextBlock
+                        x:Uid="Settings_AppBranch"
                         Margin="5,0,0,0"
                         FontSize="14"
                         FontWeight="SemiLight"
                         Foreground="{StaticResource UnisonGreenBrightBrush}"
-                        Text="{x:Bind ViewModel.AppBranch, Mode=OneWay}" />
+                        Text="Release" />
                 </StackPanel>
 
                 <StackPanel

@@ -16,13 +16,14 @@ namespace Unison.Uwp.Services.WhatsApp
     /// silently if the device was not on its lowest memory level. From the outside that read as a
     /// minute of nothing followed by names appearing for no reason - so the wait now ends as soon
     /// as the sync actually settles, the pressure check retries instead of abandoning the pass, and
-    /// both report what they are doing.
+    /// both report what they are doing. Quiet floors and enrichment budgets follow
+    /// <c>SyncBudget</c> (memory + hot sync), not a Mobile/desktop flag.
     /// </remarks>
     public partial class WhatsAppService
     {
         /// <summary>Breathing room the UI gets before enrichment starts, even on a fast device.</summary>
         private TimeSpan StartupQuietFloor =>
-            IsWindowsMobile ? TimeSpan.FromSeconds(3) : TimeSpan.FromSeconds(1);
+            TimeSpan.FromMilliseconds(CurrentSyncPacing.StartupQuietFloorMs);
 
         private static readonly TimeSpan StartupQuietPollInterval = TimeSpan.FromMilliseconds(500);
 
@@ -47,7 +48,7 @@ namespace Unison.Uwp.Services.WhatsApp
         {
             var elapsed = Stopwatch.StartNew();
             // Do not paint "Finishing startup…" over an open conversation.
-            if (string.IsNullOrWhiteSpace(_activeChatJid))
+            if (string.IsNullOrWhiteSpace(_activeChat.Jid))
             {
                 RaiseSyncStatus(SyncPhaseStatus.Format(SyncPhaseStatus.Settling));
             }
@@ -68,7 +69,7 @@ namespace Unison.Uwp.Services.WhatsApp
                         continue;
                     }
 
-                    if (!_initialSyncSafeModeActive && !IsReplayDrainActive)
+                    if (!_initialSync.IsActive && !IsReplayDrainActive)
                     {
                         break;
                     }
@@ -86,6 +87,7 @@ namespace Unison.Uwp.Services.WhatsApp
                 "reason=" + (reason ?? string.Empty) +
                 "; waitedMs=" + (long)elapsed.Elapsed.TotalMilliseconds +
                 "; budgetMs=" + (long)budget.TotalMilliseconds +
+                "; frugal=" + UseFrugalSyncBudget +
                 "; memory=" + MemoryManager.AppMemoryUsageLevel);
 
             if (token.IsCancellationRequested)
@@ -158,45 +160,6 @@ namespace Unison.Uwp.Services.WhatsApp
         private static IDisposable TraceStartupPhase(string phase)
         {
             return new StartupPhaseTrace(phase);
-        }
-
-        private sealed class StartupPhaseTrace : IDisposable
-        {
-            private readonly string _phase;
-            private readonly Stopwatch _elapsed;
-            private readonly AppMemoryUsageLevel _entryLevel;
-            private bool _closed;
-
-            internal StartupPhaseTrace(string phase)
-            {
-                _phase = phase ?? string.Empty;
-                _entryLevel = MemoryManager.AppMemoryUsageLevel;
-                _elapsed = Stopwatch.StartNew();
-
-                RuntimeDiagnosticsService.Instance.Write(
-                    "startup-phase",
-                    _phase + ":begin",
-                    "memory=" + _entryLevel +
-                    "; bytes=" + MemoryManager.AppMemoryUsage);
-            }
-
-            public void Dispose()
-            {
-                if (_closed)
-                {
-                    return;
-                }
-
-                _closed = true;
-                _elapsed.Stop();
-                RuntimeDiagnosticsService.Instance.Write(
-                    "startup-phase",
-                    _phase + ":end",
-                    "elapsedMs=" + _elapsed.ElapsedMilliseconds +
-                    "; memory=" + MemoryManager.AppMemoryUsageLevel +
-                    "; entryMemory=" + _entryLevel +
-                    "; bytes=" + MemoryManager.AppMemoryUsage);
-            }
         }
     }
 }

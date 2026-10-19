@@ -122,7 +122,7 @@ namespace Unison.Uwp.Data
 
         /// <summary>
         /// Initialize the store and create necessary folders for the current sync epoch.
-        /// Legacy LocalFolder/Messages is not migrated â€” abandoned + force history repair.
+        /// Legacy LocalFolder/Messages is not migrated — abandoned + force history repair.
         /// </summary>
         public async Task InitializeAsync()
         {
@@ -1126,10 +1126,14 @@ namespace Unison.Uwp.Data
                     }
 
                     bool isGroup = JidHelper.IsGroupJid(jid);
+                    string stripParticipant = isGroup
+                        ? ParticipantStripIdentity.PreferForDisplay(latest.ParticipantJid)
+                        : null;
                     string author = ChatPreviewNormalizer.FormatListAuthorPrefix(
                         latest,
                         isGroup,
-                        LocalizedStrings.Get("Chat_SelfFallbackName", "You"));
+                        LocalizedStrings.Get("Chat_SelfFallbackName", "You"),
+                        stripParticipant);
                     string preview = ChatPreviewNormalizer.FormatListPreview(latest, isGroup);
                     if (string.IsNullOrWhiteSpace(preview))
                     {
@@ -1148,6 +1152,8 @@ namespace Unison.Uwp.Data
                         Name = jid.Split('@')[0],
                         LastMessage = cleanPreview,
                         LastMessageAuthor = author,
+                        LastMessageParticipantJid = stripParticipant,
+                        LastMessageSenderName = isGroup && !latest.IsFromMe ? latest.SenderName : null,
                         LastMessageKind = kind,
                         Timestamp = latest.Timestamp.ToString("g"),
                         LastMessageTimestampUtc = Unison.Core.Mappers.WhatsAppMapper.ToUtc(latest.Timestamp),
@@ -1367,11 +1373,13 @@ namespace Unison.Uwp.Data
             await _writeLock.WaitAsync();
             try
             {
-                // Filter to only save names for JIDs that have chats
-                var chatJidSet = new HashSet<string>(chatJids);
+                // Filter to only save names for JIDs that have chats. Case-insensitive, like
+                // the map these names come from and like the alias save below: an ordinal set
+                // silently dropped any name whose key differed in case from the chat's address.
+                var chatJidSet = new HashSet<string>(chatJids, StringComparer.OrdinalIgnoreCase);
                 var filteredNames = allContactNames
                     .Where(kvp => chatJidSet.Contains(kvp.Key))
-                    .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                    .ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.OrdinalIgnoreCase);
 
                 var file = await _storeRoot.CreateFileAsync(CONTACT_NAMES_FILE, CreationCollisionOption.ReplaceExisting);
                 var json = await SerializeJsonAsync(filteredNames);
@@ -1427,10 +1435,10 @@ namespace Unison.Uwp.Data
             await _writeLock.WaitAsync();
             try
             {
-                var chatJidSet = new HashSet<string>(chatJids);
+                var chatJidSet = new HashSet<string>(chatJids, StringComparer.OrdinalIgnoreCase);
                 var filteredNames = allPhoneNames
                     .Where(kvp => chatJidSet.Contains(kvp.Key))
-                    .ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+                    .ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.OrdinalIgnoreCase);
 
                 var file = await _storeRoot.CreateFileAsync(PHONE_CONTACT_NAMES_FILE, CreationCollisionOption.ReplaceExisting);
                 var json = await SerializeJsonAsync(filteredNames);

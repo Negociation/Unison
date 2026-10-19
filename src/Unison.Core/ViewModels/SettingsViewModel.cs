@@ -9,6 +9,7 @@ using Unison.Core.Contracts.WhatsApp;
 using Unison.Core.Helpers;
 using Unison.Core.Mappers;
 using Unison.Core.Models;
+using Unison.Core.State;
 
 namespace Unison.Core.ViewModels
 {
@@ -27,10 +28,13 @@ namespace Unison.Core.ViewModels
         private readonly IAppLanguageService _appLanguage;
         private readonly IStringResources _strings;
         private readonly IDialogService _dialogService;
+        private readonly IStartTilePinService _startTiles;
+        private readonly IMediaDiskUsageService _diskUsage;
 
         /// <summary>Owns leaving the account: unlink on the server, then wipe locally.</summary>
         private readonly IConnectionService _connectionService;
         private readonly IContactService _contacts;
+        private readonly SyncStatusChannel _syncStatus;
 
         private readonly ShellViewModel _shell;
 
@@ -39,8 +43,13 @@ namespace Unison.Core.ViewModels
         private bool _shellChangeBusy;
         private bool _languageChangeBusy;
         private bool _timeFormatChangeBusy;
+        private bool _messageSoundChangeBusy;
+        private bool _groupSoundChangeBusy;
         private bool _disconnectBusy;
         private bool _publishContactsBusy;
+        private bool _diskMeasured;
+        private bool _diskBusy;
+        private string _diskUsageText = "Calculando...";
 
         public SettingsViewModel(
             ILocalSettings localSettings,
@@ -51,9 +60,12 @@ namespace Unison.Core.ViewModels
             IAppLanguageService appLanguage,
             IStringResources strings,
             IDialogService dialogService,
+            IStartTilePinService startTiles,
+            IMediaDiskUsageService diskUsage,
             IConnectionService connectionService,
             ShellViewModel shell,
-            IContactService contacts = null)
+            IContactService contacts = null,
+            SyncStatusChannel syncStatus = null)
         {
             _localSettings = localSettings;
             _liveTilesService = liveTilesService;
@@ -63,13 +75,20 @@ namespace Unison.Core.ViewModels
             _appLanguage = appLanguage;
             _strings = strings;
             _dialogService = dialogService;
+            _startTiles = startTiles ?? throw new ArgumentNullException(nameof(startTiles));
+            _diskUsage = diskUsage ?? throw new ArgumentNullException(nameof(diskUsage));
             _connectionService = connectionService ?? throw new ArgumentNullException(nameof(connectionService));
             _shell = shell;
             _contacts = contacts;
+            _syncStatus = syncStatus;
 
             _shell.PropertyChanged += OnShellPropertyChanged;
 
             LeaveCommand = new RelayCommand(() => LeaveRequested?.Invoke(this, EventArgs.Empty));
+            ChooseStartTileCommand = new RelayCommand(() => { _ = ChooseStartTileAsync(); });
+            CleanMediaCacheCommand = new RelayCommand(
+                () => { _ = CleanMediaCacheAsync(); },
+                () => CanCleanMediaCache);
             ChangeShellCommand = new RelayCommand<int>(index =>
             {
                 if (_shellChangeBusy)
@@ -97,6 +116,24 @@ namespace Unison.Core.ViewModels
 
                 ChangeTimeFormat(index);
             });
+            ChangeMessageNotificationSoundCommand = new RelayCommand<int>(index =>
+            {
+                if (_messageSoundChangeBusy)
+                {
+                    return;
+                }
+
+                ChangeMessageNotificationSound(index);
+            });
+            ChangeGroupNotificationSoundCommand = new RelayCommand<int>(index =>
+            {
+                if (_groupSoundChangeBusy)
+                {
+                    return;
+                }
+
+                ChangeGroupNotificationSound(index);
+            });
             DisconnectCommand = new RelayCommand(() =>
             {
                 if (_disconnectBusy)
@@ -116,6 +153,17 @@ namespace Unison.Core.ViewModels
         /// <summary>Signed-in avatar URL (from shell profile).</summary>
         public string CurrentUserAvatar => _shell.CurrentUserAvatar;
 
+        /// <summary>Push name. Empty when the account has no name yet.</summary>
+        public string CurrentUserName => _shell.CurrentUserName;
+
+        /// <summary>Account phone digits.</summary>
+        public string CurrentUserPhone => _shell.CurrentUserPhone;
+
+        /// <summary>
+        /// About text ("recado"). <see cref="Profile"/> does not store it yet, so this stays empty.
+        /// </summary>
+        public string ProfileStatus => string.Empty;
+
         public bool NotificationsEnabled
         {
             get => _localSettings.Get<bool>(LocalSettingsConstants.NotificationsEnabled);
@@ -123,6 +171,22 @@ namespace Unison.Core.ViewModels
             {
                 _localSettings.Set(LocalSettingsConstants.NotificationsEnabled, value);
                 _notificationService.OnNotificationsConfigChanged();
+                OnPropertyChanged();
+            }
+        }
+
+        /// <summary>Chat-list synchronization line. Off drops the text before it reaches the list.</summary>
+        public bool ShowSyncStatus
+        {
+            get => _localSettings.Get<bool>(LocalSettingsConstants.ShowSyncStatus);
+            set
+            {
+                _localSettings.Set(LocalSettingsConstants.ShowSyncStatus, value);
+                if (!value)
+                {
+                    _syncStatus?.Raise(null);
+                }
+
                 OnPropertyChanged();
             }
         }
@@ -271,14 +335,37 @@ namespace Unison.Core.ViewModels
         /// <summary>ComboBox SelectedIndex (OneWay). Changes go through <see cref="ChangeTimeFormatCommand"/>.</summary>
         public int SelectedTimeFormatIndex => (int)SelectedTimeFormat;
 
+        /// <summary>Toast sound for 1:1 messages.</summary>
+        public NotificationSound SelectedMessageNotificationSound
+        {
+            get
+            {
+                int raw = _localSettings.Get<int>(LocalSettingsConstants.MessageNotificationSound);
+                return Enum.IsDefined(typeof(NotificationSound), raw)
+                    ? (NotificationSound)raw
+                    : NotificationSound.SystemDefault;
+            }
+        }
+
+        /// <summary>ComboBox SelectedIndex for message toast sound.</summary>
+        public int SelectedMessageNotificationSoundIndex => (int)SelectedMessageNotificationSound;
+
+        /// <summary>Toast sound for group messages.</summary>
+        public NotificationSound SelectedGroupNotificationSound
+        {
+            get
+            {
+                int raw = _localSettings.Get<int>(LocalSettingsConstants.GroupNotificationSound);
+                return Enum.IsDefined(typeof(NotificationSound), raw)
+                    ? (NotificationSound)raw
+                    : NotificationSound.SystemDefault;
+            }
+        }
+
+        /// <summary>ComboBox SelectedIndex for group toast sound.</summary>
+        public int SelectedGroupNotificationSoundIndex => (int)SelectedGroupNotificationSound;
+
         public string AppTitle => "Unison";
-
-        public string AppDescription =>
-            _strings.Get("Settings_AppDescription.Text",
-                "WhatsApp Client based on Baileys for Windows Universal Platform.");
-
-        public string AppBranch =>
-            _strings.Get("Settings_AppBranch.Text", "Release");
 
         public string AppVersion
         {
@@ -293,8 +380,102 @@ namespace Unison.Core.ViewModels
             "@Negociation (Thiago Araujo)" + Environment.NewLine +
             "@jjb-pro";
 
+        private async Task ChooseStartTileAsync()
+        {
+            StartTileMark current = StartTileMarkPolicy.Resolve(
+                _localSettings.Get<int>(LocalSettingsConstants.StartTileMark));
+            bool transparent = _localSettings.Get<bool>(LocalSettingsConstants.StartTileTransparent);
+            StartTileSelection chosen = await _dialogService.ShowStartTileMarkAsync(current, transparent);
+            if (chosen == null)
+            {
+                return;
+            }
+
+            _localSettings.Set(LocalSettingsConstants.StartTileMark, (int)chosen.Mark);
+            _localSettings.Set(LocalSettingsConstants.StartTileTransparent, chosen.Transparent);
+            await _startTiles.PinAsync(chosen.Mark, chosen.Transparent);
+        }
+
+        public async Task LoadDiskUsageAsync()
+        {
+            SetDiskState(busy: true, measured: false);
+            DiskUsageText = Text("Settings_DiskUsageCalculating", "Calculando...");
+            try
+            {
+                MediaDiskUsage usage = await _diskUsage.MeasureAsync();
+                DiskUsageText = string.Format(
+                    Text("Settings_DiskUsageSummary", "{0} em {1} arquivos"),
+                    ByteSizeFormat.Format(usage.TotalBytes),
+                    usage.FileCount);
+                SetDiskState(busy: false, measured: true);
+            }
+            catch (Exception ex)
+            {
+                DiskUsageText = Text("Settings_DiskUsageFailed", "Não foi possível calcular");
+                SetDiskState(busy: false, measured: false);
+                System.Diagnostics.Debug.WriteLine("[Settings] Disk usage failed: " + ex.Message);
+            }
+        }
+
+        private async Task CleanMediaCacheAsync()
+        {
+            if (!CanCleanMediaCache)
+            {
+                return;
+            }
+
+            SetDiskState(busy: true, measured: true);
+            DiskUsageText = Text("Settings_DiskUsageCalculating", "Calculando...");
+            try
+            {
+                await _diskUsage.CleanAsync();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[Settings] Media clean failed: " + ex.Message);
+            }
+
+            await LoadDiskUsageAsync();
+        }
+
+        private string Text(string key, string fallback)
+        {
+            if (_strings == null)
+            {
+                return fallback;
+            }
+
+            return _strings.Get(key, fallback);
+        }
+
+        private void SetDiskState(bool busy, bool measured)
+        {
+            _diskBusy = busy;
+            _diskMeasured = measured;
+            OnPropertyChanged(nameof(CanCleanMediaCache));
+            (CleanMediaCacheCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        }
+
         /// <summary>Leaves Settings and returns to the chats section.</summary>
         public ICommand LeaveCommand { get; }
+
+        /// <summary>Opens the Start-tile picker and pins the chosen glyph.</summary>
+        public ICommand ChooseStartTileCommand { get; }
+
+        /// <summary>Shown while media size is being measured, then the total.</summary>
+        public string DiskUsageText
+        {
+            get => _diskUsageText;
+            private set => Set(ref _diskUsageText, value);
+        }
+
+        /// <summary>Clean stays off until the measure finishes, and while a clean is running.</summary>
+        public bool CanCleanMediaCache
+        {
+            get => _diskMeasured && !_diskBusy;
+        }
+
+        public ICommand CleanMediaCacheCommand { get; }
 
         /// <summary>Applies a new app shell theme. Parameter: 0 = Unison, 1 = WhatsApp.</summary>
         public ICommand ChangeShellCommand { get; }
@@ -304,6 +485,12 @@ namespace Unison.Core.ViewModels
 
         /// <summary>Applies 24h or 12h clock. Parameter: 0 = 24 Hours, 1 = 12 Hours.</summary>
         public ICommand ChangeTimeFormatCommand { get; }
+
+        /// <summary>Applies message toast sound. Parameter: <see cref="NotificationSound"/> index.</summary>
+        public ICommand ChangeMessageNotificationSoundCommand { get; }
+
+        /// <summary>Applies group toast sound. Parameter: <see cref="NotificationSound"/> index.</summary>
+        public ICommand ChangeGroupNotificationSoundCommand { get; }
 
         /// <summary>Confirms, then wipes local auth/session and returns to pairing.</summary>
         public ICommand DisconnectCommand { get; }
@@ -316,8 +503,37 @@ namespace Unison.Core.ViewModels
             RaiseShellSelectionChanged();
             RaiseLanguageSelectionChanged();
             RaiseTimeFormatSelectionChanged();
+            RaiseNotificationSoundSelectionChanged();
             RaiseAboutCopyChanged();
             RaiseProfileHeaderChanged();
+        }
+
+        /// <summary>
+        /// Re-subscribes to the shell after the surface comes back. Safe to call more than once.
+        /// </summary>
+        /// <remarks>
+        /// The shell is a singleton and this ViewModel is transient, so the subscription has to
+        /// come off when the surface goes away - otherwise every visit to Settings leaves another
+        /// instance alive on the shell's event, raising property changes for a page that is gone.
+        /// </remarks>
+        public void Attach()
+        {
+            if (_shell != null)
+            {
+                _shell.PropertyChanged -= OnShellPropertyChanged;
+                _shell.PropertyChanged += OnShellPropertyChanged;
+            }
+
+            _ = LoadDiskUsageAsync();
+        }
+
+        /// <summary>Drops the shell subscription when the surface closes.</summary>
+        public void Detach()
+        {
+            if (_shell != null)
+            {
+                _shell.PropertyChanged -= OnShellPropertyChanged;
+            }
         }
 
         private void OnShellPropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e)
@@ -335,6 +551,7 @@ namespace Unison.Core.ViewModels
         {
             RaiseProperties(
                 nameof(NotificationsEnabled),
+                nameof(ShowSyncStatus),
                 nameof(LiveTilesEnabled),
                 nameof(LocationKeepAliveEnabled),
                 nameof(AutoUnlinkOnLogoutEnabled),
@@ -360,20 +577,31 @@ namespace Unison.Core.ViewModels
         {
             RaiseProperties(
                 nameof(AppTitle),
-                nameof(AppDescription),
-                nameof(AppBranch),
                 nameof(DeveloperPrimary),
                 nameof(Contributors));
         }
 
         private void RaiseProfileHeaderChanged()
         {
-            RaiseProperties(nameof(ProfileDisplayName), nameof(CurrentUserAvatar));
+            RaiseProperties(
+                nameof(ProfileDisplayName),
+                nameof(CurrentUserName),
+                nameof(CurrentUserPhone),
+                nameof(CurrentUserAvatar));
         }
 
         private void RaiseTimeFormatSelectionChanged()
         {
             RaiseProperties(nameof(SelectedTimeFormat), nameof(SelectedTimeFormatIndex));
+        }
+
+        private void RaiseNotificationSoundSelectionChanged()
+        {
+            RaiseProperties(
+                nameof(SelectedMessageNotificationSound),
+                nameof(SelectedMessageNotificationSoundIndex),
+                nameof(SelectedGroupNotificationSound),
+                nameof(SelectedGroupNotificationSoundIndex));
         }
 
         private void ChangeTimeFormat(int index)
@@ -399,6 +627,58 @@ namespace Unison.Core.ViewModels
             {
                 _timeFormatChangeBusy = false;
                 RaiseTimeFormatSelectionChanged();
+            }
+        }
+
+        private void ChangeMessageNotificationSound(int index)
+        {
+            if (!Enum.IsDefined(typeof(NotificationSound), index))
+            {
+                return;
+            }
+
+            var sound = (NotificationSound)index;
+            if (sound == SelectedMessageNotificationSound)
+            {
+                return;
+            }
+
+            _messageSoundChangeBusy = true;
+            try
+            {
+                _localSettings.Set(LocalSettingsConstants.MessageNotificationSound, (int)sound);
+                _notificationService.OnNotificationsConfigChanged();
+            }
+            finally
+            {
+                _messageSoundChangeBusy = false;
+                RaiseNotificationSoundSelectionChanged();
+            }
+        }
+
+        private void ChangeGroupNotificationSound(int index)
+        {
+            if (!Enum.IsDefined(typeof(NotificationSound), index))
+            {
+                return;
+            }
+
+            var sound = (NotificationSound)index;
+            if (sound == SelectedGroupNotificationSound)
+            {
+                return;
+            }
+
+            _groupSoundChangeBusy = true;
+            try
+            {
+                _localSettings.Set(LocalSettingsConstants.GroupNotificationSound, (int)sound);
+                _notificationService.OnNotificationsConfigChanged();
+            }
+            finally
+            {
+                _groupSoundChangeBusy = false;
+                RaiseNotificationSoundSelectionChanged();
             }
         }
 

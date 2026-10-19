@@ -18,6 +18,7 @@
 // =============================================================================
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using Unison.Baileys.Client;
 using Unison.Baileys.Protocol;
@@ -108,7 +109,21 @@ namespace Unison.Socket.Session
             _events.Buffer();
             _log.Debug("[Offline] Buffering events until the backlog is drained");
 
-            var _ = Task.Delay(BufferSafetyTimeout).ContinueWith(t => ReleaseBufferAsync("timed out"));
+            // Unwrapped, so a failure inside the release is observed rather than left on a
+            // task nobody holds. This is the safety net for the buffer; if it throws quietly,
+            // events stay buffered and the list simply stops updating.
+            var _ = Task.Delay(BufferSafetyTimeout)
+                .ContinueWith(
+                    t => ReleaseBufferAsync("timed out"),
+                    CancellationToken.None,
+                    TaskContinuationOptions.None,
+                    TaskScheduler.Default)
+                .Unwrap()
+                .ContinueWith(
+                    t => _log.Warn("[Offline] Buffer safety release failed: " + t.Exception?.GetBaseException().Message),
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnFaulted,
+                    TaskScheduler.Default);
         }
 
         /// <summary>Releases the buffer if it is still held. Safe to call more than once.</summary>
@@ -131,9 +146,19 @@ namespace Unison.Socket.Session
 
             // Timeout must still tell the host the replay window is over. Without this,
             // the chat-list header stays on "Updating..." forever (it only clears on "synced").
+            // But BeginBuffering runs *before* TLS — if connect is still hung, claiming
+            // pending-notifications would publish a false "synced" with socket=False.
             if (string.Equals(reason, "timed out", StringComparison.Ordinal) &&
                 !ReceivedPendingNotifications)
             {
+                if (!_connection.IsConnected)
+                {
+                    _log.Warn(
+                        "[Offline] Safety timeout before connect completed; " +
+                        "not claiming pending notifications");
+                    return;
+                }
+
                 ReceivedPendingNotifications = true;
                 _log.Info("[Offline] Safety timeout: treating pending notifications as received");
                 await _events.EmitAsync(

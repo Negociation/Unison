@@ -56,7 +56,7 @@ namespace Unison.Uwp.Services
         private int _flushRequested;
         private int _droppedLineCount;
         private string _lastHealthFingerprint;
-        private IWhatsAppService _whatsAppService;
+        private IRuntimeSnapshotSource _snapshotSource;
 
         public static RuntimeDiagnosticsService Instance
         {
@@ -67,12 +67,17 @@ namespace Unison.Uwp.Services
         {
         }
 
-        /// <summary>
-        /// Wires the WhatsApp service used by health snapshots (avoids static Instance lookup).
-        /// </summary>
-        public void AttachWhatsAppService(IWhatsAppService whatsAppService)
+        /// <summary>Wires what health snapshots sample (avoids a static Instance lookup).</summary>
+        public void AttachSnapshotSource(IRuntimeSnapshotSource source)
         {
-            _whatsAppService = whatsAppService;
+            _snapshotSource = source;
+        }
+
+        public bool IsVerboseLoggingEnabled => VerboseLog.IsEnabled;
+
+        public void SetVerboseLogging(bool enabled, string source)
+        {
+            VerboseLog.Set(enabled, source ?? "diagnostics");
         }
 
         public void Start()
@@ -170,17 +175,23 @@ namespace Unison.Uwp.Services
         {
             try
             {
-                var whatsApp = _whatsAppService;
-                if (whatsApp == null)
+                var source = _snapshotSource;
+                if (source == null)
                 {
                     return new RuntimeDiagnosticsSnapshot
                     {
                         CapturedUtc = DateTime.UtcNow,
-                        ConnectionStatus = "whatsapp-not-attached"
+                        ConnectionStatus = "whatsapp-not-attached",
+                        WebPSupportEnabled = Helpers.WebPHelpers.HasWebPCodec,
+                        WebPApiContract7 = Helpers.WebPHelpers.HasApiContract7,
+                        WebPDecoderIdListed = Helpers.WebPHelpers.WebPDecoderIdListed,
+                        WebPDecodeStatus = Helpers.WebPDecoder.LastDecodeStatus,
+                        WebPLibInPackage = Helpers.WebPDecoder.LibWebPInPackage,
+                        WebPSharpYuvInPackage = Helpers.WebPDecoder.LibSharpYuvInPackage
                     };
                 }
 
-                return whatsApp.GetRuntimeDiagnosticsSnapshot();
+                return source.CaptureRuntimeSnapshot();
             }
             catch (Exception ex)
             {
@@ -257,25 +268,62 @@ namespace Unison.Uwp.Services
                 Write("diagnostics", "export-requested");
                 await FlushAsync("export");
 
-                var picker = new FileSavePicker();
-                picker.SuggestedStartLocation = PickerLocationId.DocumentsLibrary;
-                picker.FileTypeChoices.Add("Text report", new List<string> { ".txt" });
-                picker.SuggestedFileName = "unison_diagnostics_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                StorageFile destination = await picker.PickSaveFileAsync();
-                if (destination == null)
+                string report = await BuildFullReportAsync();
+
+                try
                 {
-                    return "Cancelled";
+                    var picker = new FileSavePicker();
+                    picker.SuggestedStartLocation = PickerLocationId.DocumentsLibrary;
+                    picker.FileTypeChoices.Add("Text report", new List<string> { ".txt" });
+                    picker.SuggestedFileName = "unison_diagnostics_" + DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                    StorageFile destination = await picker.PickSaveFileAsync();
+                    if (destination != null)
+                    {
+                        await FileIO.WriteTextAsync(destination, report);
+                        return destination.Path;
+                    }
+                }
+                catch (Exception pickerEx)
+                {
+                    RecordException("diagnostics", "export-picker-failed", pickerEx);
                 }
 
-                string report = await BuildFullReportAsync();
-                await FileIO.WriteTextAsync(destination, report);
-                return destination.Path;
+                // Mobile / picker cancelled: always land a copy under LocalState.
+                return await WriteReportToLocalFolderAsync(report);
             }
             catch (Exception ex)
             {
                 RecordException("diagnostics", "export-failed", ex);
                 return "Error: " + ex.Message;
             }
+        }
+
+        public async Task<string> SaveReportToLocalFolderAsync()
+        {
+            try
+            {
+                Write("diagnostics", "save-local-requested");
+                await FlushAsync("save-local");
+                string report = await BuildFullReportAsync();
+                return await WriteReportToLocalFolderAsync(report);
+            }
+            catch (Exception ex)
+            {
+                RecordException("diagnostics", "save-local-failed", ex);
+                return "Error: " + ex.Message;
+            }
+        }
+
+        private async Task<string> WriteReportToLocalFolderAsync(string report)
+        {
+            StorageFolder folder = await ApplicationData.Current.LocalFolder.CreateFolderAsync(
+                DiagnosticsFolderName,
+                CreationCollisionOption.OpenIfExists);
+            string name = "unison_diagnostics_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".txt";
+            StorageFile file = await folder.CreateFileAsync(name, CreationCollisionOption.GenerateUniqueName);
+            await FileIO.WriteTextAsync(file, report ?? string.Empty);
+            Write("diagnostics", "save-local-ok", file.Path);
+            return file.Path;
         }
 
         public async Task ClearAsync()
@@ -446,7 +494,7 @@ namespace Unison.Uwp.Services
                 Package package = Package.Current;
                 PackageVersion version = package.Id.Version;
                 return string.Format(
-                    "package={0}; version={1}.{2}.{3}.{4}; architecture={5}; memory={6}/{7}MB; level={8}",
+                    "package={0}; version={1}.{2}.{3}.{4}; architecture={5}; memory={6}/{7}MB; level={8}; category={9}",
                     package.Id.Name,
                     version.Major,
                     version.Minor,
@@ -455,7 +503,13 @@ namespace Unison.Uwp.Services
                     package.Id.Architecture,
                     MemoryManager.AppMemoryUsage / (1024UL * 1024UL),
                     MemoryManager.AppMemoryUsageLimit / (1024UL * 1024UL),
-                    MemoryManager.AppMemoryUsageLevel);
+                    MemoryManager.AppMemoryUsageLevel,
+                    DeviceCategories.CapForMobile(
+                        DeviceCategories.FromAppMemoryLimit(MemoryManager.AppMemoryUsageLimit),
+                        string.Equals(
+                            Windows.System.Profile.AnalyticsInfo.VersionInfo.DeviceFamily,
+                            "Windows.Mobile",
+                            StringComparison.OrdinalIgnoreCase)));
             }
             catch (Exception ex)
             {

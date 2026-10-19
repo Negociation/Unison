@@ -537,12 +537,17 @@ namespace Unison.Baileys.Client
             byte[] cipherKey;
             DeriveSenderMessageCipherMaterial(messageKeySeed, out iv, out cipherKey);
 
-            byte[] ciphertext = CryptoUtils.AesCbcEncrypt(plaintext, cipherKey, iv);
+            // Same Signal pad as 1:1 EncryptMessage / libsignal GroupCipher. Without it the
+            // handset unpads the trailing protobuf byte as pad length and the skmsg is garbage.
+            byte[] paddedPlaintext = PadRandomMax16(plaintext);
+            byte[] ciphertext = CryptoUtils.AesCbcEncrypt(paddedPlaintext, cipherKey, iv);
             byte[] serialized = BuildSenderKeyMessageBytes(state.KeyId, iteration, ciphertext, state.SigningPrivateKey);
 
             state.Iteration = iteration + 1;
             state.ChainKey = AdvanceSenderChainKey(currentChainKey);
-            PersistSenderKeyState(groupJid, normalizedSender, state, "outgoing group send");
+            // Never .Wait() on the keystore here: a prior queued persist for the same key can
+            // leave the send path blocked forever (UI freeze on the second group send).
+            PersistSenderKeyState(groupJid, normalizedSender, state, "outgoing group send", waitForDisk: false);
 
             return new GroupEncryptResult
             {
@@ -1073,9 +1078,9 @@ namespace Unison.Baileys.Client
                 byte[] cipherKey;
                 DeriveSenderMessageCipherMaterial(messageKeySeed, out iv, out cipherKey);
 
-                // Decrypt ciphertext using AES-CBC
+                // Decrypt ciphertext using AES-CBC, then peel Signal pad (padRandomMax16).
                 byte[] ciphertext = skMsg.Ciphertext.ToByteArray();
-                byte[] plaintext = CryptoUtils.AesCbcDecrypt(ciphertext, cipherKey, iv);
+                byte[] plaintext = UnpadRandomMax16(CryptoUtils.AesCbcDecrypt(ciphertext, cipherKey, iv));
 
                 // Update stored state: advance chain one more step for next message
                 state.Iteration = targetIteration + 1;
@@ -2264,13 +2269,37 @@ namespace Unison.Baileys.Client
         /// </summary>
         private static byte[] PadRandomMax16(byte[] data)
         {
-            var random = new Random();
-            int padLen = random.Next(1, 17); // 1-16 bytes
+            // Drawn from the crypto RNG rather than a fresh System.Random, which seeds itself
+            // from a low-resolution clock: two messages encrypted in the same tick were padded
+            // to the same length with the same bytes.
+            byte[] noise = CryptoUtils.RandomBytes(16);
+            int padLen = (noise[0] % 16) + 1;
+
             var result = new byte[data.Length + padLen];
             Array.Copy(data, result, data.Length);
             for (int i = 0; i < padLen - 1; i++)
-                result[data.Length + i] = (byte)random.Next(256);
+                result[data.Length + i] = noise[i + 1];
             result[result.Length - 1] = (byte)padLen;
+            return result;
+        }
+
+        /// <summary>Inverse of <see cref="PadRandomMax16"/> — last byte is the pad length (1-16).</summary>
+        private static byte[] UnpadRandomMax16(byte[] data)
+        {
+            if (data == null || data.Length == 0)
+            {
+                return data;
+            }
+
+            int padLen = data[data.Length - 1] & 0xFF;
+            if (padLen < 1 || padLen > 16 || padLen > data.Length)
+            {
+                // Legacy skmsg without Signal pad (PKCS7-only era): keep bytes as-is.
+                return data;
+            }
+
+            var result = new byte[data.Length - padLen];
+            Array.Copy(data, result, result.Length);
             return result;
         }
 
@@ -2429,14 +2458,15 @@ namespace Unison.Baileys.Client
                 ProtocolRuntimeLog.Write($"[Signal]   PreKeyId: {session.PendingPreKeyId}");
                 ProtocolRuntimeLog.Write($"[Signal]   SignedPreKeyId: {session.PendingSignedPreKeyId}");
 
-                // CRITICAL: We MUST use standard Signal Protocol tags for Baileys/Signal compatibility!
-                // WhatsApp's generated WAProto.cs has them scrambled, so we serialize manually.
-                // 1. registrationId (uint32)
-                // 2. preKeyId (uint32)
-                // 3. signedPreKeyId (uint32)
-                // 4. baseKey (bytes)
-                // 5. identityKey (bytes)
-                // 6. message (bytes)
+                // Written by hand, in the libsignal field order the code below actually uses:
+                // preKeyId=1, baseKey=2, identityKey=3, message=4, registrationId=5,
+                // signedPreKeyId=6.
+                //
+                // A comment here used to claim the generated WAProto.cs had these scrambled and
+                // listed a different numbering (1=registrationId … 6=message). It does not, and
+                // that list is not what this code writes - following it would break every pkmsg.
+                // Left as a hand-rolled serializer because it works and is the part of the
+                // handshake hardest to test; the numbering above is the contract.
                 
                 using (var ms = new System.IO.MemoryStream())
                 {
@@ -2498,94 +2528,7 @@ namespace Unison.Baileys.Client
 
             ProtocolRuntimeLog.Write($"[Signal] Encrypted message ({finalType}): {finalResult.Length} bytes, new SendingCounter={session.SendingCounter}");
 
-            // Self-test: Verify that we can decrypt what we just encrypted
-            if (finalType == "pkmsg")
-            {
-                VerifyDecryption(finalResult, session, paddedPlaintext);
-            }
-
             return new EncryptResult { Type = finalType, Ciphertext = finalResult };
-            }
-        }
-
-        private void VerifyDecryption(byte[] fullPacket, SessionData session, byte[] expectedPlaintext)
-        {
-            try
-            {
-                ProtocolRuntimeLog.Write($"[Signal] === STARTING SELF-TEST DECRYPTION ===");
-                
-                // 1. Skip version byte
-                byte[] proto = new byte[fullPacket.Length - 1];
-                Array.Copy(fullPacket, 1, proto, 0, proto.Length);
-
-            // 2. Extract Tag 4 (Message) from PreKeySignalMessage
-            byte[] innerPacket = null;
-            int pos = 0;
-            while (pos < proto.Length)
-            {
-                int tagByte = proto[pos++];
-                int tag = tagByte >> 3;
-                int wire = tagByte & 0x07;
-
-                if (tag == 4 && wire == 2) // Message tag (WhatsApp Tag 4)
-                {
-                    // Length-delimited varint
-                    int len = proto[pos++];
-                    if (len > 0x7F)
-                    {
-                        len = (len & 0x7F) | ((proto[pos++] & 0x7F) << 7);
-                    }
-
-                    innerPacket = new byte[len];
-                    Array.Copy(proto, pos, innerPacket, 0, len);
-                    break;
-                }
-                else if (wire == 0) // Varint
-                {
-                    while ((proto[pos++] & 0x80) != 0) ;
-                }
-                else if (wire == 2) // Length-delimited
-                {
-                    int len = proto[pos++];
-                    if (len > 0x7F)
-                    {
-                        len = (len & 0x7F) | ((proto[pos++] & 0x7F) << 7);
-                    }
-                    pos += len;
-                }
-                else
-                {
-                    break;
-                }
-            }
-
-            if (innerPacket == null)
-            {
-                ProtocolRuntimeLog.Write($"[Signal] SELF-TEST FAIL: Could not find inner message tag 4");
-                return;
-            }
-                
-                // 3. Extract SignalMessage from innerPacket
-                byte innerVersion = innerPacket[0];
-                byte[] signalProto = new byte[innerPacket.Length - 1 - 8];
-                Array.Copy(innerPacket, 1, signalProto, 0, signalProto.Length);
-                var signalMsg = SignalMessage.Parser.ParseFrom(signalProto);
-                
-                // 4. Verification
-                byte[] ciphertext = signalMsg.Ciphertext.ToByteArray();
-                if (VerboseSignalLogging)
-                {
-                    ProtocolRuntimeLog.Write($"[Signal] SELF-TEST: Inner version: {innerVersion:X2}");
-                    ProtocolRuntimeLog.Write($"[Signal] SELF-TEST: SignalMsg: Counter={signalMsg.Counter}, RatchetKey={BitConverter.ToString(signalMsg.RatchetKey.ToByteArray().Take(4).ToArray())}...");
-                    ProtocolRuntimeLog.Write($"[Signal] SELF-TEST: Ciphertext (first 8): {BitConverter.ToString(ciphertext.Take(8).ToArray())}");
-                    ProtocolRuntimeLog.Write($"[Signal] SELF-TEST: Expected Plaintext (first 8): {BitConverter.ToString(expectedPlaintext.Take(8).ToArray())}");
-                }
-
-                ProtocolRuntimeLog.Write($"[Signal] === SELF-TEST COMPLETED ===");
-            }
-            catch (Exception ex)
-            {
-                ProtocolRuntimeLog.Write($"[Signal] SELF-TEST ERROR: {ex.Message}");
             }
         }
     }

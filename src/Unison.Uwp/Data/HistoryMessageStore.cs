@@ -21,7 +21,7 @@ namespace Unison.Uwp.Data
     {
         private static readonly string DatabaseFileName = "unison.db";
 
-        public const int CurrentSchemaVersion = 7;
+        public const int CurrentSchemaVersion = 8;
 
         /// <summary>
         /// Timeline open / load-more: protocol thumbs live on disk (<c>MediaLocalUri</c> / poster).
@@ -68,8 +68,10 @@ namespace Unison.Uwp.Data
                 _connection = new SQLiteAsyncConnection(dbPath);
                 await _connection.CreateTableAsync<HistoryMessageRow>().ConfigureAwait(false);
                 await _connection.CreateTableAsync<HistoryMessageReactionRow>().ConfigureAwait(false);
+                await EnsureFlagDeletedColumnAsync().ConfigureAwait(false);
                 await DropLegacyThumbnailColumnAsync().ConfigureAwait(false);
                 await EnsureIndexesAsync().ConfigureAwait(false);
+                await StaleOutgoingSweep.EnsureRanAsync(_connection).ConfigureAwait(false);
                 _initialized = true;
                 Debug.WriteLine("[HistoryMessageStore] Initialized schema=" + CurrentSchemaVersion + " at " + dbPath);
             }
@@ -79,7 +81,7 @@ namespace Unison.Uwp.Data
             }
         }
 
-        public Task UpsertManyAsync(IReadOnlyList<HistoryMessage> rows)
+        public async Task UpsertManyAsync(IReadOnlyList<HistoryMessage> rows)
         {
             var batch = new HistoryMessageWriteBatch();
             if (rows != null)
@@ -93,16 +95,16 @@ namespace Unison.Uwp.Data
                 }
             }
 
-            return PersistWriteBatchAsync(batch);
+            await PersistWriteBatchAsync(batch).ConfigureAwait(false);
         }
 
-        public Task UpsertLiveMessagesAsync(string chatJid, IReadOnlyList<ChatMessage> messages)
+        public async Task UpsertLiveMessagesAsync(string chatJid, IReadOnlyList<ChatMessage> messages)
         {
             HistoryMessageWriteBatch batch = HistoryLiveMessageMapper.ToWriteBatch(chatJid, messages);
-            return PersistWriteBatchAsync(batch);
+            await PersistWriteBatchAsync(batch).ConfigureAwait(false);
         }
 
-        public Task UpsertReactionsAsync(IReadOnlyList<HistoryMessageReaction> reactions)
+        public async Task UpsertReactionsAsync(IReadOnlyList<HistoryMessageReaction> reactions)
         {
             var batch = new HistoryMessageWriteBatch();
             if (reactions != null)
@@ -116,10 +118,10 @@ namespace Unison.Uwp.Data
                 }
             }
 
-            return PersistWriteBatchAsync(batch);
+            await PersistWriteBatchAsync(batch).ConfigureAwait(false);
         }
 
-        public Task UpsertPinsAsync(IReadOnlyList<HistoryMessagePinUpdate> pins)
+        public async Task UpsertPinsAsync(IReadOnlyList<HistoryMessagePinUpdate> pins)
         {
             var batch = new HistoryMessageWriteBatch();
             if (pins != null)
@@ -133,7 +135,7 @@ namespace Unison.Uwp.Data
                 }
             }
 
-            return PersistWriteBatchAsync(batch);
+            await PersistWriteBatchAsync(batch).ConfigureAwait(false);
         }
 
         public async Task<HistoryMessage> GetAsync(string chatJid, string messageId)
@@ -159,11 +161,12 @@ namespace Unison.Uwp.Data
             return list[0];
         }
 
-        public async Task PersistWriteBatchAsync(HistoryMessageWriteBatch batch)
+        public async Task<HistoryWriteBatchResult> PersistWriteBatchAsync(HistoryMessageWriteBatch batch)
         {
+            var empty = new HistoryWriteBatchResult();
             if (batch == null || batch.IsEmpty)
             {
-                return;
+                return empty;
             }
 
             await EnsureInitializedAsync().ConfigureAwait(false);
@@ -171,12 +174,26 @@ namespace Unison.Uwp.Data
             string syncId = null;
             string syncType = null;
             int upserted = 0;
+            int skippedExisting = 0;
             var chats = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
                 await _connection.RunInTransactionAsync(conn =>
                 {
-                    upserted += WriteMessages(conn, batch.Messages, chats, ref syncId, ref syncType);
+                    HashSet<string> existingBodyIds = null;
+                    if (batch.PreferDeltaSkipExistingBodies)
+                    {
+                        existingBodyIds = LoadExistingMessageIds(conn, batch);
+                    }
+
+                    upserted += WriteMessages(
+                        conn,
+                        batch.Messages,
+                        chats,
+                        ref syncId,
+                        ref syncType,
+                        existingBodyIds,
+                        out skippedExisting);
                     if (batch.ReplaceExistingReactions)
                     {
                         ClearReactionsForMessages(conn, batch);
@@ -192,17 +209,19 @@ namespace Unison.Uwp.Data
                 _writeLock.Release();
             }
 
+            var jids = new List<string>(chats);
             if (upserted > 0 || chats.Count > 0)
             {
                 Debug.WriteLine(
                     "[HistoryMessageStore] Persist msgs=" + upserted +
+                    " skippedExisting=" + skippedExisting +
                     " reactions=" + (batch.Reactions?.Count ?? 0) +
                     " pins=" + (batch.Pins?.Count ?? 0) +
                     " revokes=" + (batch.Revokes?.Count ?? 0) +
                     " chats=" + chats.Count +
+                    " delta=" + batch.PreferDeltaSkipExistingBodies +
                     " syncId=" + (syncId ?? "") +
                     " type=" + (syncType ?? ""));
-                var jids = new List<string>(chats);
                 ChunkPersisted?.Invoke(this, new HistoryMessageChunkEventArgs
                 {
                     SyncId = syncId ?? string.Empty,
@@ -212,6 +231,20 @@ namespace Unison.Uwp.Data
                     ChatJids = jids
                 });
             }
+            else if (skippedExisting > 0)
+            {
+                Debug.WriteLine(
+                    "[HistoryMessageStore] Delta no new bodies skippedExisting=" + skippedExisting +
+                    " reactions=" + (batch.Reactions?.Count ?? 0) +
+                    " pins=" + (batch.Pins?.Count ?? 0) +
+                    " revokes=" + (batch.Revokes?.Count ?? 0));
+            }
+
+            return new HistoryWriteBatchResult
+            {
+                UpsertedCount = upserted,
+                ChatJids = jids
+            };
         }
 
         public async Task<IReadOnlyList<HistoryMessage>> GetForChatAsync(
@@ -231,7 +264,7 @@ namespace Unison.Uwp.Data
             List<HistoryMessageRow> rows;
             if (beforeUtc.HasValue)
             {
-                DateTime before = beforeUtc.Value;
+                DateTime before = HistorySqlCursor.ForQuery(beforeUtc.Value);
                 string beforeId = beforeMessageId ?? string.Empty;
                 rows = await _connection.QueryAsync<HistoryMessageRow>(
                     TimelineSelectSql +
@@ -298,7 +331,7 @@ namespace Unison.Uwp.Data
 
             if (beforeUtc.HasValue)
             {
-                DateTime before = beforeUtc.Value;
+                DateTime before = HistorySqlCursor.ForQuery(beforeUtc.Value);
                 string beforeId = beforeMessageId ?? string.Empty;
                 sql.Append(" AND (TimestampUtc < ? OR (TimestampUtc = ? AND MessageId < ?))");
                 args.Add(before);
@@ -717,6 +750,51 @@ namespace Unison.Uwp.Data
             }
         }
 
+        /// <inheritdoc />
+        public async Task<int> DeleteForChatKeysAsync(IReadOnlyList<string> chatJids)
+        {
+            var keys = NormalizeChatKeys(chatJids);
+            if (keys.Count == 0)
+            {
+                return 0;
+            }
+
+            await EnsureInitializedAsync().ConfigureAwait(false);
+            await _writeLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                var placeholders = new StringBuilder();
+                var args = new object[keys.Count];
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    if (i > 0)
+                    {
+                        placeholders.Append(',');
+                    }
+
+                    placeholders.Append('?');
+                    args[i] = keys[i];
+                }
+
+                string filter = " WHERE ChatJid IN (" + placeholders + ")";
+                int removed = await _connection
+                    .ExecuteAsync("DELETE FROM history_message" + filter, args)
+                    .ConfigureAwait(false);
+                await _connection
+                    .ExecuteAsync("DELETE FROM history_message_reaction" + filter, args)
+                    .ConfigureAwait(false);
+
+                Debug.WriteLine(
+                    "[HistoryMessageStore] Deleted " + removed + " row(s) for " + keys.Count + " key(s)");
+
+                return removed;
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+
         private async Task EnsureInitializedAsync()
         {
             if (!_initialized)
@@ -803,18 +881,102 @@ namespace Unison.Uwp.Data
                    uri.EndsWith("_thumb", StringComparison.OrdinalIgnoreCase);
         }
 
+        private static HashSet<string> LoadExistingMessageIds(
+            SQLiteConnection conn,
+            HistoryMessageWriteBatch batch)
+        {
+            var ids = new HashSet<string>(StringComparer.Ordinal);
+            if (conn == null || batch?.Messages == null || batch.Messages.Count == 0)
+            {
+                return ids;
+            }
+
+            var chats = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < batch.Messages.Count; i++)
+            {
+                HistoryMessage message = batch.Messages[i];
+                if (message == null || string.IsNullOrWhiteSpace(message.ChatJid))
+                {
+                    continue;
+                }
+
+                chats.Add(JidHelper.Normalize(message.ChatJid));
+            }
+
+            if (chats.Count == 0)
+            {
+                return ids;
+            }
+
+            // One IN query for the chats this chunk touches — only MessageId columns.
+            var chatList = new List<string>(chats);
+            var sql = new StringBuilder(
+                "SELECT ChatJid, MessageId FROM history_message WHERE ChatJid IN (");
+            var args = new object[chatList.Count];
+            for (int i = 0; i < chatList.Count; i++)
+            {
+                if (i > 0)
+                {
+                    sql.Append(',');
+                }
+
+                sql.Append('?');
+                args[i] = chatList[i];
+            }
+
+            sql.Append(')');
+
+            try
+            {
+                List<MessageIdRow> rows = conn.Query<MessageIdRow>(sql.ToString(), args);
+                if (rows != null)
+                {
+                    for (int i = 0; i < rows.Count; i++)
+                    {
+                        MessageIdRow row = rows[i];
+                        if (row == null ||
+                            string.IsNullOrWhiteSpace(row.ChatJid) ||
+                            string.IsNullOrWhiteSpace(row.MessageId))
+                        {
+                            continue;
+                        }
+
+                        ids.Add(HistoryMessageRow.MakeId(row.ChatJid, row.MessageId));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("[HistoryMessageStore] LoadExistingMessageIds failed: " + ex.Message);
+            }
+
+            return ids;
+        }
+
+        private sealed class MessageIdRow
+        {
+            public string ChatJid { get; set; }
+
+            public string MessageId { get; set; }
+        }
+
         private static int WriteMessages(
             SQLiteConnection conn,
             List<HistoryMessage> rows,
             HashSet<string> chats,
             ref string syncId,
-            ref string syncType)
+            ref string syncType,
+            HashSet<string> existingBodyIds,
+            out int skippedExisting)
         {
             int upserted = 0;
+            skippedExisting = 0;
             if (rows == null)
             {
                 return 0;
             }
+
+            bool delta = existingBodyIds != null;
 
             for (int i = 0; i < rows.Count; i++)
             {
@@ -829,9 +991,19 @@ namespace Unison.Uwp.Data
                 model.ChatJid = JidHelper.Normalize(model.ChatJid);
                 syncId = model.SyncId ?? syncId;
                 syncType = model.SyncType ?? syncType;
-                chats.Add(model.ChatJid);
                 HistoryMessageRow row = ToRow(model);
-                HistoryMessageRow existing = conn.Find<HistoryMessageRow>(row.Id);
+
+                if (delta && existingBodyIds.Contains(row.Id))
+                {
+                    skippedExisting++;
+                    continue;
+                }
+
+                chats.Add(model.ChatJid);
+
+                HistoryMessageRow existing = delta
+                    ? null
+                    : conn.Find<HistoryMessageRow>(row.Id);
                 if (existing != null)
                 {
                     if (string.IsNullOrWhiteSpace(row.MediaLocalUri))
@@ -862,6 +1034,11 @@ namespace Unison.Uwp.Data
                         row.IsRevoked = true;
                     }
 
+                    if (existing.FlagDeleted)
+                    {
+                        row.FlagDeleted = true;
+                    }
+
                     // Pin/unpin is authoritative only via WritePins (or an upsert that already
                     // carries IsPinned=true). History/live body rewrites must not clear a pin
                     // the strip/banner already persisted — same idea as IsRevoked.
@@ -876,6 +1053,10 @@ namespace Unison.Uwp.Data
                 // Never persist fat protocol thumbnails in SQLite (disk URI is enough).
                 conn.InsertOrReplace(row);
                 upserted++;
+                if (delta)
+                {
+                    existingBodyIds.Add(row.Id);
+                }
             }
 
             return upserted;
@@ -1047,6 +1228,96 @@ namespace Unison.Uwp.Data
             }
         }
 
+        public async Task<IReadOnlyList<CachedMediaEntry>> ListCachedMediaAsync()
+        {
+            await InitializeAsync().ConfigureAwait(false);
+            List<HistoryMessageRow> rows = await _connection.QueryAsync<HistoryMessageRow>(
+                "SELECT ChatJid, MessageId, MediaLocalUri, MediaPosterUri FROM history_message " +
+                "WHERE IFNULL(flag_deleted, 0) = 0 AND (" +
+                "(MediaLocalUri IS NOT NULL AND MediaLocalUri != '') OR " +
+                "(MediaPosterUri IS NOT NULL AND MediaPosterUri != ''))").ConfigureAwait(false);
+            var list = new List<CachedMediaEntry>(rows.Count);
+            for (int i = 0; i < rows.Count; i++)
+            {
+                list.Add(new CachedMediaEntry
+                {
+                    ChatJid = rows[i].ChatJid,
+                    MessageId = rows[i].MessageId,
+                    LocalUri = rows[i].MediaLocalUri,
+                    PosterUri = rows[i].MediaPosterUri
+                });
+            }
+
+            return list;
+        }
+
+        public async Task MarkMediaDeletedAsync(IReadOnlyList<CachedMediaEntry> entries)
+        {
+            if (entries == null || entries.Count == 0)
+            {
+                return;
+            }
+
+            await InitializeAsync().ConfigureAwait(false);
+            await _writeLock.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await _connection.RunInTransactionAsync(conn =>
+                {
+                    for (int i = 0; i < entries.Count; i++)
+                    {
+                        CachedMediaEntry entry = entries[i];
+                        if (entry == null ||
+                            string.IsNullOrWhiteSpace(entry.ChatJid) ||
+                            string.IsNullOrWhiteSpace(entry.MessageId))
+                        {
+                            continue;
+                        }
+
+                        conn.Execute(
+                            "UPDATE history_message SET flag_deleted = 1 WHERE ChatJid = ? AND MessageId = ?",
+                            entry.ChatJid,
+                            entry.MessageId);
+                    }
+                }).ConfigureAwait(false);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+
+        public async Task<bool> IsMediaDeletedAsync(string chatJid, string messageId)
+        {
+            if (string.IsNullOrWhiteSpace(chatJid) || string.IsNullOrWhiteSpace(messageId))
+            {
+                return false;
+            }
+
+            await InitializeAsync().ConfigureAwait(false);
+            int flag = await _connection.ExecuteScalarAsync<int>(
+                "SELECT IFNULL(flag_deleted, 0) FROM history_message WHERE ChatJid = ? AND MessageId = ? LIMIT 1",
+                chatJid,
+                messageId).ConfigureAwait(false);
+            return flag != 0;
+        }
+
+        // .NET Native strips metadata from private row types ("Required Public" in Default.rd.xml),
+        // so column detection must not map PRAGMA rows; an existing column is the expected outcome.
+        private async Task EnsureFlagDeletedColumnAsync()
+        {
+            try
+            {
+                await _connection.ExecuteAsync(
+                    "ALTER TABLE history_message ADD COLUMN flag_deleted INTEGER NOT NULL DEFAULT 0").ConfigureAwait(false);
+            }
+            catch (SQLiteException ex) when (
+                ex.Message != null &&
+                ex.Message.IndexOf("duplicate column name", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+            }
+        }
+
         private static HistoryMessageRow ToRow(HistoryMessage model)
         {
             return new HistoryMessageRow
@@ -1081,6 +1352,7 @@ namespace Unison.Uwp.Data
                 QuotedBody = model.QuotedBody,
                 QuotedKind = (int)model.QuotedKind,
                 MediaLocalUri = model.MediaLocalUri,
+                FlagDeleted = model.FlagDeleted,
                 MediaPosterUri = model.MediaPosterUri,
                 MentionedJids = JoinMentionedJids(model.MentionedJids),
                 TimestampUtc = model.TimestampUtc,
